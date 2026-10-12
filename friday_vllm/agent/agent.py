@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+"""Friday vLLM 的服务器端助手：图形界面经 SSH 上传到 <工作目录>/agent.py，用服务器上的 Python（3.8 起，只用标准库）运行。
+
+    agent.py probe   --base D                          机器信息（显卡、驱动、磁盘、Python、装没装 vLLM、服务在不在跑），JSON
+    agent.py install --base D [--version V] [--index URL|auto]     后台任务：建虚拟环境、装 uv、装 vLLM
+    agent.py download --base D --repo ORG/NAME --source modelscope|huggingface|hf-mirror --dir 目标目录
+                                                       后台任务：多连接分段下载、断点续传、按 sha256 校验
+    agent.py models  --dirs 目录1,目录2                   列出已下好的模型（有 config.json 和 *.safetensors 的目录），JSON
+    agent.py serve   --base D --model 目录 ...           后台起 vllm serve，记下 pid / 端口 / 密钥
+    agent.py stop    --base D [--job serve|install|download]   停掉
+    agent.py status  --base D                          各任务的状态 + 服务健康检查，JSON
+    agent.py tail    --base D --job J --offset N         从第 N 个字节起读任务日志，JSON
+
+工作目录 D 的布局：env/（vLLM 的虚拟环境）、uv-cache/、models/（缺省下载位置）、logs/<任务>.log、state/<任务>.json。
+后台任务用 setsid 脱离 SSH 会话：界面关了、断线了照样跑完，重连后接着看。
+"""
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+DEFAULT_VLLM = "0.31.0"
+# pip 镜像（自动挑最快的）；国内机器上 PyPI 官方往往最慢
+MIRRORS = [
+    ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"),
+    ("中科大", "https://mirrors.ustc.edu.cn/pypi/simple"),
+    ("北外", "https://mirrors.bfsu.edu.cn/pypi/web/simple"),
+    ("阿里云", "https://mirrors.aliyun.com/pypi/simple"),
+    ("腾讯云", "https://mirrors.cloud.tencent.com/pypi/simple"),
+    ("PyPI", "https://pypi.org/simple"),
+]
+SOURCES = {
+    "modelscope": "https://modelscope.cn",
+    "huggingface": "https://huggingface.co",
+    "hf-mirror": "https://hf-mirror.com",
+}
+# 下载时缺省不要的：GGUF（vLLM 用不了）、原始权重、和 safetensors 重复的 PyTorch 权重、评测结果这类杂项目录
+DEFAULT_EXCLUDE = ["*.gguf", "original/*", "*.pth", "*.pt", "*.msgpack", "*.h5", "*.onnx", "onnx/*", "openvino/*"]
+CHUNK = 64 << 20          # 分段下载每段 64 MB
+CONNECTIONS = 16          # 同时开的连接
+
+
+# ── 小工具 ──
+
+def emit(obj):
+    """一行 JSON（界面按行解析）"""
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def log(text):
+    sys.stdout.write(time.strftime("%H:%M:%S ") + text + "\n")
+    sys.stdout.flush()
+
+
+def paths(base):
+    return {
+        "env": os.path.join(base, "env"),
+        "cache": os.path.join(base, "uv-cache"),
+        "models": os.path.join(base, "models"),
+        "logs": os.path.join(base, "logs"),
+        "state": os.path.join(base, "state"),
+    }
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def run(cmd, timeout=30, env=None):
+    try:
+        out = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout, env=env)
+        return out.returncode, out.stdout.strip(), out.stderr.strip()
+    except Exception as error:  # noqa: BLE001
+        return -1, "", str(error)
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    # 僵尸进程不算
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            return f.read().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+def human(size):
+    size = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return ("%.0f %s" if unit in ("B", "KB") else "%.1f %s") % (size, unit)
+        size /= 1024
+
+
+def disk_free(path):
+    probe = path
+    while probe and not os.path.exists(probe):
+        probe = os.path.dirname(probe)
+    try:
+        usage = shutil.disk_usage(probe or "/")
+        return {"path": probe, "free": usage.free, "total": usage.total}
+    except OSError:
+        return None
+
+
+# ── probe ──
+
+def gpus():
+    code, out, _ = run(["nvidia-smi", "--query-gpu=name,memory.total,memory.used,driver_version,compute_cap",
+                        "--format=csv,noheader,nounits"])
+    result = []
+    if code != 0:
+        return result
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 5:
+            result.append({"name": parts[0], "memory_total_mib": int(float(parts[1])), "memory_used_mib": int(float(parts[2])),
+                           "driver": parts[3], "compute_cap": parts[4]})
+    return result
+
+
+def vllm_version(env):
+    python = os.path.join(env, "bin", "python")
+    if not os.path.exists(os.path.join(env, "bin", "vllm")):
+        return ""
+    # 只读包的元数据（import vllm 要好几秒）
+    code, out, _ = run([python, "-c", "import importlib.metadata as m; print(m.version('vllm'))"], timeout=20)
+    return out if code == 0 else ""
+
+
+def cmd_probe(args):
+    p = paths(args.base)
+    code, ips, _ = run("hostname -I 2>/dev/null || hostname -i", timeout=5)
+    info = {
+        "agent": VERSION,
+        "os": run("uname -sr")[1],
+        "distro": (read_os_release().get("PRETTY_NAME") or ""),
+        "arch": os.uname().machine,
+        "hostname": socket.gethostname(),
+        "ips": [ip for ip in ips.split() if ip and ":" not in ip][:4],
+        "python": sys.executable,
+        "python_version": "%d.%d.%d" % sys.version_info[:3],
+        "gpus": gpus(),
+        "disk": disk_free(args.base),
+        "base": args.base,
+        "vllm": vllm_version(p["env"]),
+        "archs": read_json(os.path.join(p["state"], "archs.json"), []),
+        "jobs": jobs_status(args.base),
+    }
+    emit(info)
+
+
+def read_os_release():
+    result = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    result[key] = value.strip('"')
+    except OSError:
+        pass
+    return result
+
+
+# ── 后台任务 ──
+
+def start_job(base, job, argv):
+    """把自己以 argv 重新拉起来，脱离 SSH 会话（setsid），日志写 logs/<job>.log，状态写 state/<job>.json"""
+    p = paths(base)
+    os.makedirs(p["logs"], exist_ok=True)
+    os.makedirs(p["state"], exist_ok=True)
+    state = read_json(os.path.join(p["state"], job + ".json"), {})
+    if state.get("status") == "running" and alive(state.get("pid")):
+        emit({"ok": False, "error": "已经在跑了（pid %s）" % state.get("pid")})
+        return
+    log_path = os.path.join(p["logs"], job + ".log")
+    with open(log_path, "w") as out:
+        child = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv + ["--foreground"], stdout=out, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True, cwd=base)
+    write_json(os.path.join(p["state"], job + ".json"),
+               {"status": "running", "pid": child.pid, "started": time.time(), "argv": argv, "log": log_path})
+    emit({"ok": True, "pid": child.pid, "log": log_path})
+
+
+def finish_job(base, job, ok, message="", **extra):
+    path = os.path.join(paths(base)["state"], job + ".json")
+    state = read_json(path, {})
+    state.update({"status": "done" if ok else "failed", "finished": time.time(), "message": message})
+    state.update(extra)
+    write_json(path, state)
+
+
+def jobs_status(base):
+    p = paths(base)
+    result = {}
+    for job in ("install", "download", "serve"):
+        state = read_json(os.path.join(p["state"], job + ".json"))
+        if not state:
+            continue
+        if state.get("status") == "running" and not alive(state.get("pid")):
+            state["status"] = "failed"
+            state["message"] = state.get("message") or "进程不在了（被杀掉或机器重启）"
+        if job == "serve" and state.get("status") == "running":
+            state["healthy"] = healthy(state.get("port"))
+        result[job] = state
+    return result
+
+
+def healthy(port):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%s/health" % port, timeout=3) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cmd_status(args):
+    emit({"jobs": jobs_status(args.base), "gpus": gpus()})
+
+
+def cmd_tail(args):
+    path = os.path.join(paths(args.base)["logs"], args.job + ".log")
+    try:
+        size = os.path.getsize(path)
+        offset = args.offset if 0 <= args.offset <= size else max(0, size - 65536)
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(1 << 20)
+        emit({"offset": offset + len(data), "size": size, "text": data.decode("utf-8", "replace")})
+    except OSError:
+        emit({"offset": 0, "size": 0, "text": ""})
+
+
+def cmd_stop(args):
+    job = args.job or "serve"
+    path = os.path.join(paths(args.base)["state"], job + ".json")
+    state = read_json(path, {})
+    pid = state.get("pid")
+    if not pid or not alive(pid):
+        if state.get("status") == "running":
+            state.update({"status": "stopped", "finished": time.time()})
+            write_json(path, state)
+        emit({"ok": True, "message": "没在跑"})
+        return
+    # 整个进程组（vLLM 会起好几个子进程）
+    try:
+        os.killpg(int(pid), signal.SIGTERM)
+    except OSError:
+        os.kill(int(pid), signal.SIGTERM)
+    for _ in range(30):
+        if not alive(pid):
+            break
+        time.sleep(0.5)
+    if alive(pid):
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+    state.update({"status": "stopped", "finished": time.time(), "message": "已停止"})
+    write_json(path, state)
+    emit({"ok": True, "message": "已停止"})
+
+
+# ── install ──
+
+def fastest_mirror():
+    """每个镜像取一下 /simple/vllm/ 的页面，挑最快的"""
+    best = None
+    for name, url in MIRRORS:
+        started = time.time()
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + "/vllm/", timeout=8) as response:
+                body = response.read()
+            elapsed = time.time() - started
+            speed = len(body) / max(elapsed, 0.001)
+            log("镜像 %s：%.1f 秒（%s/s）" % (name, elapsed, human(speed)))
+            if best is None or speed > best[2]:
+                best = (name, url, speed)
+        except Exception as error:  # noqa: BLE001
+            log("镜像 %s 连不上：%s" % (name, str(error)[:80]))
+    return best
+
+
+def find_python():
+    """建虚拟环境用的 Python：3.10–3.13（vLLM 的要求）"""
+    candidates = [sys.executable, "python3.12", "python3.11", "python3.10", "python3.13", "python3", "python",
+                  "/root/miniconda3/bin/python3", "/opt/conda/bin/python3", "/usr/bin/python3"]
+    for candidate in candidates:
+        path = shutil.which(candidate) or (candidate if os.path.isabs(candidate) and os.path.exists(candidate) else None)
+        if not path:
+            continue
+        code, out, _ = run([path, "-c", "import sys, venv; print('%d.%d' % sys.version_info[:2])"])
+        if code == 0:
+            major, minor = (int(x) for x in out.split("."))
+            if major == 3 and 10 <= minor <= 13:
+                return path, out
+    return None, None
+
+
+def cmd_install(args):
+    if not args.foreground:
+        argv = ["install", "--base", args.base, "--version", args.version, "--index", args.index]
+        return start_job(args.base, "install", argv)
+    p = paths(args.base)
+    try:
+        cards = gpus()
+        if cards:
+            driver = cards[0]["driver"]
+            log("显卡：%s，驱动 %s" % (cards[0]["name"], driver))
+            if int(driver.split(".")[0]) < 580:
+                log("注意：驱动 %s 低于 580，vLLM 0.2x 起默认的 CUDA 13 版可能起不来；起不来就换旧一点的 vLLM 版本" % driver)
+        else:
+            # 装不需要显卡（AutoDL 的无卡模式开机装更省钱），运行时才要
+            log("注意：现在没检测到 NVIDIA 显卡（AutoDL 无卡模式？）。可以先装，运行时要带显卡开机")
+        python, version = find_python()
+        if not python:
+            raise RuntimeError("服务器上没有 Python 3.10–3.13（带 venv 模块）。Ubuntu 上可以 apt install python3-venv，或装 Miniconda")
+        log("Python：%s（%s）" % (python, version))
+        index = args.index
+        if index == "auto":
+            best = fastest_mirror()
+            if not best:
+                raise RuntimeError("所有 pip 镜像都连不上，检查服务器的网络")
+            log("用镜像：%s（%s）" % (best[0], best[1]))
+            index = best[1]
+        if not os.path.exists(os.path.join(p["env"], "bin", "python")):
+            log("建虚拟环境：%s" % p["env"])
+            code, out, err = run([python, "-m", "venv", p["env"]], timeout=300)
+            if code != 0:
+                raise RuntimeError("建虚拟环境失败：%s" % (err or out))
+        env_python = os.path.join(p["env"], "bin", "python")
+        log("装 uv（并行下载、自动重试）")
+        code = subprocess.call([env_python, "-m", "pip", "install", "-q", "-i", index, "--upgrade", "uv"])
+        if code != 0:
+            raise RuntimeError("装 uv 失败")
+        environment = dict(os.environ)
+        # uv 的缓存放在工作目录里（同一个盘上用硬链接，不多占一份；系统盘常常很小）
+        environment.update({"UV_CACHE_DIR": p["cache"], "UV_LINK_MODE": "hardlink", "UV_HTTP_TIMEOUT": "180",
+                            "UV_CONCURRENT_DOWNLOADS": "16", "UV_HTTP_RETRIES": "10"})
+        spec = "vllm" if args.version in ("", "latest") else "vllm==" + args.version
+        log("装 %s（torch 和 CUDA 库一共好几 GB，要一会儿）" % spec)
+        tried = [index] + [url for _, url in MIRRORS if url != index]
+        ok = False
+        for attempt in tried[:3]:
+            log("从 %s 装" % attempt)
+            code = subprocess.call([os.path.join(p["env"], "bin", "uv"), "pip", "install", "--python", env_python, "--index-url", attempt, spec],
+                                   env=environment)
+            if code == 0:
+                ok = True
+                break
+            log("这个镜像没装成，换下一个")
+        if not ok:
+            raise RuntimeError("vLLM 没装成，看上面的日志")
+        installed = vllm_version(p["env"])
+        log("vLLM %s 装好了；读它支持的模型架构" % installed)
+        code, out, err = run([env_python, "-c", "import json; from vllm import ModelRegistry; print(json.dumps(sorted(ModelRegistry.get_supported_archs())))"],
+                             timeout=600)
+        if code == 0 and out:
+            write_json(os.path.join(p["state"], "archs.json"), json.loads(out.splitlines()[-1]))
+        else:
+            log("读支持的架构失败（不影响使用）：%s" % err[-300:])
+        finish_job(args.base, "install", True, "vLLM %s 装好了" % installed, vllm=installed)
+        log("完成")
+    except Exception as error:  # noqa: BLE001
+        log("失败：%s" % error)
+        finish_job(args.base, "install", False, str(error))
+
+
+# ── download ──
+
+def http_json(url, method="GET", body=None, timeout=30):
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json",
+                                                                             "User-Agent": "friday-vllm/" + VERSION})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def list_files(source, repo, revision):
+    """[{path, size, sha256}]"""
+    base = SOURCES[source]
+    if source == "modelscope":
+        data = http_json("%s/api/v1/models/%s/repo/files?Recursive=true&Revision=%s" % (base, repo, revision or "master"))
+        if data.get("Code") not in (200, None) or not data.get("Data"):
+            raise RuntimeError("魔搭上找不到 %s：%s" % (repo, data.get("Message")))
+        return [{"path": f["Path"], "size": int(f.get("Size") or 0), "sha256": (f.get("Sha256") or "").lower()}
+                for f in data["Data"]["Files"] if f.get("Type") == "blob"]
+    data = http_json("%s/api/models/%s/tree/%s?recursive=1" % (base, repo, revision or "main"))
+    files = []
+    for f in data:
+        if f.get("type") != "file":
+            continue
+        lfs = f.get("lfs") or {}
+        files.append({"path": f["path"], "size": int(lfs.get("size") or f.get("size") or 0), "sha256": (lfs.get("oid") or "").lower()})
+    return files
+
+
+def file_url(source, repo, revision, path):
+    quoted = urllib.parse.quote(path)
+    if source == "modelscope":
+        return "%s/models/%s/resolve/%s/%s" % (SOURCES[source], repo, revision or "master", quoted)
+    return "%s/%s/resolve/%s/%s" % (SOURCES[source], repo, revision or "main", quoted)
+
+
+def wanted(files, include, exclude):
+    names = [f["path"] for f in files]
+    has_safetensors = any(n.endswith(".safetensors") for n in names)
+    result = []
+    for f in files:
+        name = f["path"]
+        if include and not any(fnmatch.fnmatch(name, pattern) for pattern in include):
+            continue
+        if any(fnmatch.fnmatch(name, pattern) for pattern in exclude):
+            continue
+        # 有 safetensors 时不要重复的 PyTorch 权重
+        if has_safetensors and re.search(r"(pytorch_model.*\.bin|\.bin\.index\.json)$", name):
+            continue
+        result.append(f)
+    return result
+
+
+class Progress:
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.lock = threading.Lock()
+        self.started = time.time()
+        self.last = 0.0
+        self.window = []   # (时间, 已下) 算最近几秒的速度
+
+    def add(self, n, name):
+        with self.lock:
+            self.done += n
+            now = time.time()
+            if now - self.last >= 1.0:
+                self.last = now
+                self.window.append((now, self.done))
+                self.window = [w for w in self.window if now - w[0] <= 10]
+                speed = (self.window[-1][1] - self.window[0][1]) / max(self.window[-1][0] - self.window[0][0], 0.001) if len(self.window) > 1 else 0
+                emit({"event": "progress", "done": self.done, "total": self.total, "speed": speed, "file": name})
+
+
+def fetch_range(url, start, end, out_path, progress, name, stop):
+    """把 [start, end] 写进 out_path 的同一位置；断了从断开的地方接着下（CDN 常常一段只给一部分就断开），连着失败才放弃"""
+    position = start
+    failures = 0
+    while position <= end:
+        if stop.is_set():
+            return False
+        before = position
+        try:
+            request = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (position, end), "User-Agent": "friday-vllm/" + VERSION})
+            with urllib.request.urlopen(request, timeout=60) as response, open(out_path, "r+b") as f:
+                if response.status != 206 and (position != 0 or response.headers.get("Content-Length") not in (None, str(end - position + 1))):
+                    raise RuntimeError("服务器不支持分段下载（HTTP %d）" % response.status)
+                f.seek(position)
+                while position <= end:
+                    block = response.read(min(1 << 20, end - position + 1))
+                    if not block:
+                        break
+                    f.write(block)
+                    position += len(block)
+                    progress.add(len(block), name)
+            if position <= end:
+                raise RuntimeError("连接断开（这一段下到 %d / %d 字节）" % (position - start, end - start + 1))
+        except Exception as error:  # noqa: BLE001
+            # 有进展就不算失败：接着下
+            failures = 0 if position > before else failures + 1
+            if failures >= 12:
+                log("%s 的 %d–%d 段连续失败 12 次，放弃：%s" % (name, start, end, str(error)[:120]))
+                return False
+            if failures:
+                log("%s 的 %d–%d 段第 %d 次失败：%s" % (name, start, end, failures, str(error)[:120]))
+                time.sleep(min(30, 2 ** failures))
+    return True
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_file(source, repo, revision, item, target, progress, pool_size, stop):
+    name = item["path"]
+    path = os.path.join(target, name)
+    part = path + ".part"
+    done_marker = path + ".partdone"   # 已下好的段（断点续传）
+    size = item["size"]
+    if os.path.exists(path) and (not size or os.path.getsize(path) == size):
+        progress.add(size, name)
+        return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    url = file_url(source, repo, revision, name)
+    if size <= CHUNK:
+        # 小文件：一次下完
+        with open(part, "wb"):
+            pass
+        ok = fetch_range(url, 0, max(size - 1, 0), part, progress, name, stop) if size else fetch_whole(url, part)
+    else:
+        if not os.path.exists(part) or os.path.getsize(part) != size:
+            with open(part, "wb") as f:
+                f.truncate(size)
+            finished = set()
+        else:
+            finished = set(read_json(done_marker, []))
+        ranges = [(i, min(i + CHUNK, size) - 1) for i in range(0, size, CHUNK)]
+        progress.add(sum(e - s + 1 for s, e in ranges if s in finished), name)
+        todo = [r for r in ranges if r[0] not in finished]
+        lock = threading.Lock()
+        failed = []
+
+        def worker():
+            while not stop.is_set():
+                with lock:
+                    if not todo:
+                        return
+                    start, end = todo.pop(0)
+                if fetch_range(url, start, end, part, progress, name, stop):
+                    with lock:
+                        finished.add(start)
+                        write_json(done_marker, sorted(finished))
+                else:
+                    with lock:
+                        failed.append(start)
+                    stop.set()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(pool_size, len(todo)))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        ok = not failed and len(finished) == len(ranges)
+    if not ok:
+        return False
+    if item.get("sha256"):
+        log("校验 %s" % name)
+        actual = sha256_of(part)
+        if actual != item["sha256"]:
+            os.remove(part)
+            if os.path.exists(done_marker):
+                os.remove(done_marker)
+            raise RuntimeError("%s 校验不对（sha256 %s，应为 %s），已删掉，重新下载即可" % (name, actual[:12], item["sha256"][:12]))
+    os.replace(part, path)
+    if os.path.exists(done_marker):
+        os.remove(done_marker)
+    return True
+
+
+def fetch_whole(url, path):
+    request = urllib.request.Request(url, headers={"User-Agent": "friday-vllm/" + VERSION})
+    with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as f:
+        shutil.copyfileobj(response, f)
+    return True
+
+
+def cmd_download(args):
+    if not args.foreground:
+        argv = ["download", "--base", args.base, "--repo", args.repo, "--source", args.source, "--dir", args.dir,
+                "--revision", args.revision or ""]
+        for pattern in args.include or []:
+            argv += ["--include", pattern]
+        return start_job(args.base, "download", argv)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    try:
+        target = os.path.abspath(os.path.expanduser(args.dir))
+        log("列 %s 上 %s 的文件" % (args.source, args.repo))
+        files = wanted(list_files(args.source, args.repo, args.revision), args.include or [], DEFAULT_EXCLUDE)
+        if not any(f["path"].endswith(".safetensors") for f in files):
+            raise RuntimeError("这个仓库里没有 safetensors 权重，vLLM 用不了（GGUF 请用 Friday 的本地模型）")
+        total = sum(f["size"] for f in files)
+        free = disk_free(target)
+        if free and free["free"] < total:
+            raise RuntimeError("%s 只剩 %s，模型要 %s" % (free["path"], human(free["free"]), human(total)))
+        log("%d 个文件，共 %s，下到 %s" % (len(files), human(total), target))
+        write_json(os.path.join(paths(args.base)["state"], "download.json"),
+                   dict(read_json(os.path.join(paths(args.base)["state"], "download.json"), {}), repo=args.repo, dir=target, total=total))
+        progress = Progress(total)
+        # 大文件一个个来、每个分段并行；小文件一起下
+        for item in sorted(files, key=lambda f: f["size"]):
+            if stop.is_set():
+                raise RuntimeError("已取消")
+            if not download_file(args.source, args.repo, args.revision, item, target, progress, CONNECTIONS, stop):
+                raise RuntimeError("已取消" if stop.is_set() else "%s 下载失败" % item["path"])
+        with open(os.path.join(target, ".friday-vllm.json"), "w", encoding="utf-8") as f:
+            json.dump({"repo": args.repo, "source": args.source, "downloaded": time.time()}, f, ensure_ascii=False)
+        emit({"event": "progress", "done": total, "total": total, "speed": 0, "file": ""})
+        finish_job(args.base, "download", True, "%s 下好了" % args.repo, dir=target)
+        log("完成：%s" % target)
+    except Exception as error:  # noqa: BLE001
+        log("失败：%s" % error)
+        finish_job(args.base, "download", False, str(error))
+
+
+# ── models ──
+
+def describe_model(directory):
+    config = read_json(os.path.join(directory, "config.json"), {})
+    size = 0
+    partial = False
+    for root, _, names in os.walk(directory):
+        for name in names:
+            if name.endswith((".part", ".partdone")):
+                partial = True
+            try:
+                size += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    text = config.get("text_config") or {}
+    quant = config.get("quantization_config") or text.get("quantization_config") or {}
+    method = quant.get("quant_method") or ""
+    if method == "compressed-tensors":
+        groups = quant.get("config_groups") or {}
+        formats = {str((g.get("weights") or {}).get("num_bits")) + "bit-" + str((g.get("weights") or {}).get("type")) for g in groups.values()}
+        method = "compressed-tensors（%s）" % "、".join(sorted(formats)) if formats else method
+        if quant.get("format"):
+            method = quant["format"]
+    meta = read_json(os.path.join(directory, ".friday-vllm.json"), {})
+    return {
+        "path": directory,
+        "name": meta.get("repo") or os.path.basename(directory.rstrip("/")),
+        "size": size,
+        "architectures": config.get("architectures") or [],
+        "model_type": config.get("model_type") or text.get("model_type") or "",
+        "quantization": method,
+        "max_len": config.get("max_position_embeddings") or text.get("max_position_embeddings") or 0,
+        "complete": not partial,
+    }
+
+
+def cmd_models(args):
+    found = []
+    seen = set()
+    for directory in [d for d in (args.dirs or "").split(",") if d]:
+        directory = os.path.abspath(os.path.expanduser(directory))
+        if not os.path.isdir(directory):
+            continue
+        for root, dirs, names in os.walk(directory):
+            depth = root[len(directory):].count(os.sep)
+            if depth > 4:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if "config.json" in names and any(n.endswith((".safetensors", ".safetensors.part")) for n in names):
+                if root not in seen:
+                    seen.add(root)
+                    found.append(describe_model(root))
+                dirs[:] = []
+    emit({"models": found})
+
+
+# ── serve ──
+
+def parsers_for(model_dir):
+    """按模型家族给 vLLM 的工具调用、思考解析器（vLLM 的 recipes）；认不出来的不开工具调用"""
+    config = read_json(os.path.join(model_dir, "config.json"), {})
+    kind = (config.get("model_type") or (config.get("text_config") or {}).get("model_type") or "").lower()
+    name = os.path.basename(model_dir.rstrip("/")).lower()
+    if kind.startswith(("qwen3_5", "qwen3_6", "qwen3_next")) or "coder" in name and kind.startswith("qwen3"):
+        return "qwen3_coder", "qwen3"
+    if kind.startswith("qwen3"):
+        return "hermes", "qwen3"
+    if kind.startswith("qwen2"):
+        return "hermes", ""
+    if kind.startswith("deepseek_v3"):
+        return "deepseek_v3", "deepseek_r1"
+    if kind.startswith("glm4_moe") or kind.startswith("glm"):
+        return "glm45", "glm45"
+    if kind.startswith("gpt_oss"):
+        return "openai", "openai_gptoss"
+    if kind.startswith("kimi"):
+        return "kimi_k2", ""
+    if kind.startswith("llama"):
+        return "llama3_json", ""
+    if kind.startswith("mistral") or kind.startswith("mixtral"):
+        return "mistral", ""
+    return "", ""
+
+
+def cmd_serve(args):
+    p = paths(args.base)
+    vllm = os.path.join(p["env"], "bin", "vllm")
+    if not os.path.exists(vllm):
+        emit({"ok": False, "error": "还没装 vLLM"})
+        return
+    state = read_json(os.path.join(p["state"], "serve.json"), {})
+    if state.get("status") == "running" and alive(state.get("pid")):
+        emit({"ok": False, "error": "服务已经在跑（pid %s，端口 %s），先停掉" % (state.get("pid"), state.get("port"))})
+        return
+    if not gpus():
+        emit({"ok": False, "error": "没检测到 NVIDIA 显卡（nvidia-smi 不能用）：vLLM 要显卡才能跑。AutoDL 上要用「有卡模式」开机"})
+        return
+    model = os.path.abspath(os.path.expanduser(args.model))
+    if not os.path.exists(os.path.join(model, "config.json")):
+        emit({"ok": False, "error": "%s 不是模型目录（没有 config.json）" % model})
+        return
+    tool, reasoning = parsers_for(model)
+    if args.tool_parser != "auto":
+        tool = args.tool_parser if args.tool_parser != "none" else ""
+    if args.reasoning_parser != "auto":
+        reasoning = args.reasoning_parser if args.reasoning_parser != "none" else ""
+    cmd = [vllm, "serve", model, "--served-model-name", args.name, "--host", args.host, "--port", str(args.port),
+           "--gpu-memory-utilization", str(args.gpu_util), "--max-num-seqs", str(args.max_seqs), "--enable-prefix-caching"]
+    if args.key:
+        cmd += ["--api-key", args.key]
+    if args.max_len:
+        cmd += ["--max-model-len", str(args.max_len)]
+    if tool:
+        cmd += ["--enable-auto-tool-choice", "--tool-call-parser", tool]
+    if reasoning:
+        cmd += ["--reasoning-parser", reasoning]
+    if args.extra:
+        cmd += args.extra.split()
+    os.makedirs(p["logs"], exist_ok=True)
+    log_path = os.path.join(p["logs"], "serve.log")
+    environment = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_NO_USAGE_STATS="1", DO_NOT_TRACK="1")
+    # torch.compile 的缓存放工作目录里：第二次启动快很多
+    environment.setdefault("VLLM_CACHE_ROOT", os.path.join(args.base, "vllm-cache"))
+    with open(log_path, "w") as out:
+        out.write("$ " + " ".join(c if args.key is None or c != args.key else "***" for c in cmd) + "\n")
+        out.flush()
+        child = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+                                 cwd=args.base, env=environment)
+    write_json(os.path.join(p["state"], "serve.json"),
+               {"status": "running", "pid": child.pid, "started": time.time(), "log": log_path, "port": args.port, "host": args.host,
+                "key": args.key, "name": args.name, "model": model, "tool_parser": tool, "reasoning_parser": reasoning})
+    emit({"ok": True, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning})
+
+
+# ── 入口 ──
+
+def main():
+    parser = argparse.ArgumentParser(prog="agent.py")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name, function):
+        command = sub.add_parser(name)
+        command.add_argument("--base", default=os.path.expanduser("~/friday-vllm"))
+        command.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+        command.set_defaults(function=function)
+        return command
+
+    add("probe", cmd_probe)
+    add("status", cmd_status)
+    command = add("install", cmd_install)
+    command.add_argument("--version", default=DEFAULT_VLLM)
+    command.add_argument("--index", default="auto")
+    command = add("download", cmd_download)
+    command.add_argument("--repo", required=True)
+    command.add_argument("--source", default="modelscope", choices=sorted(SOURCES))
+    command.add_argument("--dir", required=True)
+    command.add_argument("--revision", default="")
+    command.add_argument("--include", action="append")
+    command = add("models", cmd_models)
+    command.add_argument("--dirs", default="")
+    command = add("serve", cmd_serve)
+    command.add_argument("--model", required=True)
+    command.add_argument("--name", required=True)
+    command.add_argument("--host", default="0.0.0.0")
+    command.add_argument("--port", type=int, default=8000)
+    command.add_argument("--key", default=None)
+    command.add_argument("--gpu-util", type=float, default=0.9)
+    command.add_argument("--max-len", type=int, default=0)
+    command.add_argument("--max-seqs", type=int, default=256)
+    command.add_argument("--tool-parser", default="auto")
+    command.add_argument("--reasoning-parser", default="auto")
+    command.add_argument("--extra", default="")
+    command = add("stop", cmd_stop)
+    command.add_argument("--job", default="serve")
+    command = add("tail", cmd_tail)
+    command.add_argument("--job", required=True)
+    command.add_argument("--offset", type=int, default=-1)
+    args = parser.parse_args()
+    # 后台任务的工作目录是 base：相对路径都先转成绝对的
+    args.base = os.path.abspath(os.path.expanduser(args.base))
+    for name in ("dir", "model"):
+        if getattr(args, name, None):
+            setattr(args, name, os.path.abspath(os.path.expanduser(getattr(args, name))))
+    os.makedirs(args.base, exist_ok=True)
+    args.function(args)
+
+
+if __name__ == "__main__":
+    main()
