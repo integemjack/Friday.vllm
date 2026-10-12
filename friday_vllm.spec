@@ -2,7 +2,8 @@
 #   pyinstaller --noconfirm friday_vllm.spec
 import sys
 
-from friday_vllm import __version__
+sys.path.insert(0, SPECPATH)  # noqa: F821（PyInstaller 给的：spec 所在目录）
+from friday_vllm import __version__  # noqa: E402
 
 block_cipher = None
 # agent.py 是传到服务器上跑的脚本：作为数据文件放在包里同样的相对位置（ssh.py 按 __file__ 找它）
