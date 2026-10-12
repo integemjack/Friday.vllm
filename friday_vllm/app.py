@@ -80,14 +80,19 @@ class MainWindow(QMainWindow):
         self.models = []
         self.offsets = {}
         self.polling = False
-        self.watch = None            # 正在看日志的任务：install / download / serve
+        self.watch = None            # 正在看日志的任务：install / download / serve:<服务 id>
+        self.services = {}           # 服务器上的服务（可以同时有好几个），id → 状态
+        self.selectedService = None
+        self.tunnels = {}            # 服务 id → 本机隧道端口
+        self.gpuUse = None           # 别的服务占着的显卡（变了才重建显卡勾选）
         self.download_started = None
 
         tabs = QTabWidget()
         tabs.addTab(self._server_tab(), "服务器")
         tabs.addTab(self._install_tab(), "安装引擎")
         tabs.addTab(self._models_tab(), "模型")
-        tabs.addTab(self._serve_tab(), "运行")
+        tabs.addTab(self._serve_tab(), "新建服务")
+        tabs.addTab(self._services_tab(), "服务")
         self.tabs = tabs
 
         self.logView = QPlainTextEdit()
@@ -331,7 +336,7 @@ class MainWindow(QMainWindow):
         self.disconnectButton.setEnabled(connected)
         for widget in (self.host, self.port, self.user, self.password, self.keyFile, self.base, self.profile):
             widget.setEnabled(not connected)
-        for index in (1, 2, 3):
+        for index in (1, 2, 3, 4):
             self.tabs.widget(index).setEnabled(connected)
         if connected:
             self.statusBar().showMessage("已连上 %s@%s（工作目录 %s）" % (self.conn.user, self.conn.host, self.conn.base))
@@ -358,10 +363,11 @@ class MainWindow(QMainWindow):
         engines = p.get("engines") or {}
         for engine, (title, *_rest) in ENGINES.items():
             rows.append((title, engines.get(engine) or "没装（到「安装引擎」里装）"))
-        serve = (p.get("jobs") or {}).get("serve") or {}
-        if serve.get("status") == "running":
-            rows.append(("服务", "在跑：%s（%s），端口 %s%s" % (serve.get("name"), ENGINES.get(serve.get("engine") or "vllm", ("vLLM",))[0],
-                                                          serve.get("port"), "" if serve.get("healthy") else "，还在启动")))
+        for service in (p.get("services") or {}).values():
+            if service.get("status") == "running":
+                rows.append(("服务", "%s（%s），端口 %s%s%s" % (service.get("name"), ENGINES.get(service.get("engine") or "vllm", ("vLLM",))[0],
+                                                          service.get("port"), "，显卡 %s" % ",".join(str(i) for i in service["gpus"]) if service.get("gpus") else "",
+                                                          "" if service.get("healthy") else "，还在启动")))
         self.serverInfo.setText("<table cellspacing=6>" + "".join("<tr><td><b>%s</b></td><td>%s</td></tr>" % row for row in rows) + "</table>")
         installed = ["%s %s" % (ENGINES[e][0], v) for e, v in engines.items() if v and e in ENGINES]
         self.installedLabel.setText("已装：" + "、".join(installed) if installed else "还都没装")
@@ -378,6 +384,8 @@ class MainWindow(QMainWindow):
         self._apply_filters()
         self._rebuild_gpus(cards)
         self._apply_jobs(p.get("jobs") or {})
+        if p.get("services") is not None and p.get("services") != self.services:
+            self._apply_services(p.get("services") or {})
 
     # ── 安装 ──
 
@@ -600,7 +608,7 @@ class MainWindow(QMainWindow):
         index = self.serveModel.findData(path)
         if index >= 0:
             self.serveModel.setCurrentIndex(index)
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(3)   # 新建服务
 
     def _search(self):
         source = self.source.currentData()
@@ -796,15 +804,40 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         self.startButton = QPushButton("启动")
         self.startButton.clicked.connect(self._start_serve)
-        self.stopButton = QPushButton("停止")
-        self.stopButton.clicked.connect(lambda: self._stop_job("serve"))
-        self.serveStatus = QLabel("没在跑")
+        self.launchNote = QLabel("一台机器上可以同时开好几个服务：用不同的显卡、不同的端口；开好的在「服务」页里看、停")
+        self.launchNote.setStyleSheet("color: gray")
+        self.launchNote.setWordWrap(True)
         buttons.addWidget(self.startButton)
+        buttons.addWidget(self.launchNote, 1)
+        layout.addLayout(buttons)
+        layout.addStretch(1)
+        return page
+
+    def _services_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.serviceTable = QTableWidget(0, 6)
+        self.serviceTable.setHorizontalHeaderLabels(["服务", "引擎", "模型", "显卡", "端口", "状态"])
+        self._table_style(self.serviceTable)
+        self.serviceTable.itemSelectionChanged.connect(self._pick_service)
+        layout.addWidget(self.serviceTable, 1)
+        buttons = QHBoxLayout()
+        self.stopButton = QPushButton("停止")
+        self.stopButton.clicked.connect(self._stop_service)
+        self.forgetButton = QPushButton("删除记录")
+        self.forgetButton.setToolTip("删掉停了的服务的记录和日志")
+        self.forgetButton.clicked.connect(self._forget_service)
+        newButton = QPushButton("新建服务…")
+        newButton.clicked.connect(lambda: self.tabs.setCurrentIndex(3))
+        self.serveStatus = QLabel()
+        self.serveStatus.setWordWrap(True)
         buttons.addWidget(self.stopButton)
+        buttons.addWidget(self.forgetButton)
+        buttons.addWidget(newButton)
         buttons.addWidget(self.serveStatus, 1)
         layout.addLayout(buttons)
 
-        box = QGroupBox("OpenAI 兼容地址")
+        box = QGroupBox("OpenAI 兼容地址（选中的服务）")
         grid = QGridLayout(box)
         self.remoteURL = readonly()
         self.tunnelURL = readonly()
@@ -841,11 +874,10 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.keyText, 5, 1)
         grid.addWidget(copy_button(self.keyText.text), 5, 2)
         friday = QLabel("在 Friday 里用：设置 › 服务与密钥 › 添加服务 › 自定义（OpenAI 兼容），地址、密钥、模型名照上面填；"
-                        "起步并发可以调到 16 以上（vLLM、SGLang 并发越多越快）。隧道要这个窗口开着才通。")
+                        "起步并发可以调到 16 以上（vLLM、SGLang 并发越多越快）。每个服务可以各开一个隧道，隧道要这个窗口开着才通。")
         friday.setWordWrap(True)
         grid.addWidget(friday, 6, 0, 1, 3)
         layout.addWidget(box)
-        layout.addStretch(1)
         return page
 
     def _engine_changed(self, *_):
@@ -856,9 +888,8 @@ class MainWindow(QMainWindow):
             combo.clear()
             for name in names:
                 combo.addItem({"auto": "自动（按模型家族）", "none": off}.get(name, name), name)
-        running = (self.jobs.get("serve") or {}).get("status") == "running"
         installed = bool((self.probe.get("engines") or {}).get(engine))
-        self.startButton.setEnabled(bool(self.conn) and not running and installed)
+        self.startButton.setEnabled(bool(self.conn) and installed)
         self.startButton.setToolTip("" if installed else "还没装 %s（到「安装引擎」里装）" % title)
 
     def _model_changed(self, *_):
@@ -876,6 +907,12 @@ class MainWindow(QMainWindow):
             check.deleteLater()
         self.gpuChecks = []
         self.gpuEmpty.setVisible(not cards)
+        taken = {}
+        for service in self.services.values():
+            if service.get("status") == "running":
+                for index in service.get("gpus") or []:
+                    taken[index] = service.get("name") or service.get("id")
+        self.gpuUse = tuple(sorted(taken.items()))
         for position, card in enumerate(cards):
             used = card["memory_used_mib"] / max(card["memory_total_mib"], 1)
             name = card["name"].replace("NVIDIA ", "").replace("GeForce ", "").replace(" Blackwell Server Edition", "")
@@ -884,7 +921,11 @@ class MainWindow(QMainWindow):
             check.setToolTip(card["name"])
             check.setProperty("index", card.get("index", position))
             check.setProperty("memory", card["memory_total_mib"] * 1024 * 1024)
-            check.setChecked(used < 0.1)
+            owner = taken.get(card.get("index", position))
+            check.setChecked(used < 0.1 and owner is None)
+            if owner is not None:
+                check.setText(check.text().split("（")[0] + "（%s 在用）" % owner)
+                check.setEnabled(False)
             check.toggled.connect(self._auto_parallel)
             self.gpuGrid.addWidget(check, position // 4, position % 4)
             self.gpuChecks.append(check)
@@ -968,45 +1009,148 @@ class MainWindow(QMainWindow):
                 return
             args += ["--gpus", ",".join(str(check.property("index")) for check in chosen),
                      "--tp", self.tpSize.value(), "--dp", self.dpSize.value()]
-        self.offsets["serve"] = 0
-        self.watch = "serve"
         self.log("启动 %s：%s（端口 %d）" % (ENGINES[engine][0], path, self.servePort.value()))
 
         def done(result):
             if not result.get("ok"):
                 QMessageBox.warning(self, "启动失败", result.get("error") or "没能启动")
                 return
-            self.log("工具调用解析：%s，思考解析：%s；加载模型、编译要几分钟" % (result.get("tool_parser") or "不开", result.get("reasoning_parser") or "不解析"))
+            sid = result["id"]
+            self.log("服务 %s：工具调用解析 %s，思考解析 %s；加载模型、编译要几分钟" % (
+                sid, result.get("tool_parser") or "不开", result.get("reasoning_parser") or "不解析"))
+            self.selectedService = sid
+            self.watch = "serve:" + sid
+            self.offsets[self.watch] = 0
+            self.tabs.setCurrentIndex(4)
             self._poll()
 
         background(self.conn.agent, *args, done=done, failed=self.fail("启动失败"))
 
-    def _toggle_tunnel(self):
-        serve = self.jobs.get("serve") or {}
-        local = self.localPort.value()
-        if self.conn.tunnel_open(local):
-            self.conn.close_tunnel(local)
-            self.log("隧道已关")
-        else:
-            if not serve.get("port"):
-                QMessageBox.information(self, APP, "服务还没启动")
+    def _service(self):
+        return self.services.get(self.selectedService) or {}
+
+    def _pick_service(self):
+        rows = self.serviceTable.selectionModel().selectedRows()
+        if not rows:
+            return
+        sid = self.serviceTable.item(rows[0].row(), 0).data(Qt.UserRole)
+        if sid == self.selectedService:
+            return
+        self.selectedService = sid
+        # 日志跟着选中的服务看（从末尾 64 KB 起）
+        self.watch = "serve:" + sid
+        self.offsets[self.watch] = -1
+        if sid in self.tunnels:
+            self.localPort.setValue(self.tunnels[sid])
+        self._update_addresses()
+        self._poll()
+
+    def _stop_service(self):
+        service = self._service()
+        if not service:
+            return
+        background(self.conn.agent, "stop", "--job", "serve", "--id", service["id"],
+                   done=lambda r: (self.log("服务 %s：%s" % (service["id"], r.get("message", ""))), self._poll()), failed=self.fail("停止失败"))
+
+    def _forget_service(self):
+        service = self._service()
+        if not service:
+            return
+        def done(result):
+            if not result.get("ok"):
+                QMessageBox.information(self, APP, result.get("error") or "删不了")
                 return
-            port = free_local_port(local)
-            if port != local:
-                self.localPort.setValue(port)
-            try:
-                self.conn.open_tunnel(port, serve["port"])
-                self.log("隧道：本机 127.0.0.1:%d → 服务器 127.0.0.1:%s" % (port, serve["port"]))
-            except OSError as error:
-                QMessageBox.warning(self, "开不了隧道", str(error))
+            self.selectedService = None
+            self._poll()
+        background(self.conn.agent, "forget", "--id", service["id"], done=done, failed=self.fail("删除失败"))
+
+    def _apply_services(self, services):
+        before = self.services
+        self.services = services
+        # 停了的服务：关掉它的隧道
+        for sid, port in list(self.tunnels.items()):
+            if (services.get(sid) or {}).get("status") != "running":
+                self.conn.close_tunnel(port)
+                del self.tunnels[sid]
+                self.log("服务 %s 不在跑了，隧道已关" % sid)
+        if self.selectedService not in services:
+            running = [sid for sid, sv in services.items() if sv.get("status") == "running"]
+            self.selectedService = (running or list(services) or [None])[0]
+            if self.selectedService and not (self.watch or "").startswith(("install", "download")):
+                self.watch = "serve:" + self.selectedService
+        texts = {"running": "运行中", "failed": "没起来 / 退出了", "stopped": "已停止"}
+        self.serviceTable.blockSignals(True)
+        self.serviceTable.setRowCount(len(services))
+        for row, (sid, service) in enumerate(services.items()):
+            status = texts.get(service.get("status"), service.get("status") or "")
+            if service.get("status") == "running" and not service.get("healthy"):
+                status = "启动中…"
+            parallel = ""
+            if (service.get("tp") or 1) > 1 or (service.get("dp") or 1) > 1:
+                parallel = "（TP %s × DP %s）" % (service.get("tp") or 1, service.get("dp") or 1)
+            values = [service.get("name") or sid, ENGINES.get(service.get("engine") or "vllm", ("vLLM",))[0],
+                      os.path.basename((service.get("model") or "").rstrip("/")),
+                      ",".join(str(i) for i in service.get("gpus") or []) + parallel, str(service.get("port") or ""),
+                      status + ("，隧道 %d" % self.tunnels[sid] if sid in self.tunnels else "")]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, sid)
+                self.serviceTable.setItem(row, column, item)
+            if sid == self.selectedService:
+                self.serviceTable.selectRow(row)
+        self.serviceTable.blockSignals(False)
+        # 新建服务页：别的服务占着的显卡、端口
+        use = tuple(sorted((i, sv.get("name") or sid) for sid, sv in services.items() if sv.get("status") == "running" for i in sv.get("gpus") or []))
+        if use != self.gpuUse:
+            self._rebuild_gpus(self.probe.get("gpus") or [])
+        ports = {int(sv.get("port") or 0) for sv in services.values() if sv.get("status") == "running"}
+        if self.servePort.value() in ports:
+            port = 8000
+            while port in ports:
+                port += 1
+            self.servePort.setValue(port)
+        if before.keys() != services.keys() or any((before.get(k) or {}).get("status") != v.get("status") for k, v in services.items()):
+            self._show_probe_services(services)
         self._update_addresses()
 
+    def _show_probe_services(self, services):
+        self.probe["services"] = services
+        if self.conn:
+            self._show_probe()
+
+    def _toggle_tunnel(self):
+        service = self._service()
+        sid = service.get("id")
+        if sid in self.tunnels:
+            self.conn.close_tunnel(self.tunnels.pop(sid))
+            self.log("服务 %s 的隧道已关" % sid)
+        else:
+            if service.get("status") != "running":
+                QMessageBox.information(self, APP, "选一个在跑的服务")
+                return
+            local = self.localPort.value()
+            if local in self.tunnels.values():
+                local = max(self.tunnels.values()) + 1
+            port = free_local_port(local)
+            self.localPort.setValue(port)
+            try:
+                self.conn.open_tunnel(port, service["port"])
+                self.tunnels[sid] = port
+                self.settings.setValue("localPort", port)
+                self.log("服务 %s 的隧道：本机 127.0.0.1:%d → 服务器 127.0.0.1:%s" % (sid, port, service["port"]))
+            except OSError as error:
+                QMessageBox.warning(self, "开不了隧道", str(error))
+        self._apply_services(self.services)
+
     def _test(self):
-        url = self.tunnelURL.text() if self.conn.tunnel_open(self.localPort.value()) else self.remoteURL.text()
+        service = self._service()
+        url = self.tunnelURL.text() if service.get("id") in self.tunnels else self.remoteURL.text()
         key = self.keyText.text()
+        if not url.startswith("http"):
+            return
 
         def work():
-            request = urllib.request.Request(url.rstrip("/") + "/models", headers={"Authorization": "Bearer " + key} if key else {})
+            request = urllib.request.Request(url.split("（")[0].rstrip("/") + "/models", headers={"Authorization": "Bearer " + key} if key else {})
             with urllib.request.urlopen(request, timeout=10) as response:
                 return [m["id"] for m in json.loads(response.read().decode())["data"]]
 
@@ -1014,16 +1158,26 @@ class MainWindow(QMainWindow):
                    failed=self.fail("连不上 %s" % url))
 
     def _update_addresses(self):
-        serve = self.jobs.get("serve") or {}
-        running = serve.get("status") == "running"
+        service = self._service()
+        running = service.get("status") == "running"
+        self.stopButton.setEnabled(running)
+        self.forgetButton.setEnabled(bool(service) and not running)
+        self.tunnelButton.setEnabled(running)
+        self.testButton.setEnabled(running)
+        if not service:
+            self.serveStatus.setText("还没有服务：到「新建服务」里开一个")
+        elif running:
+            self.serveStatus.setText("%s：%s" % (service["id"], "运行中" if service.get("healthy") else "启动中（加载模型、编译，几分钟），日志在下面"))
+        else:
+            self.serveStatus.setText("%s：%s" % (service["id"], service.get("message") or {"failed": "没起来，看下面的日志", "stopped": "已停止"}.get(service.get("status"), "")))
         if not running:
             for field in (self.remoteURL, self.tunnelURL, self.modelName, self.keyText):
                 field.clear()
             self.remoteNote.clear()
             self.tunnelButton.setText("开隧道")
             return
-        port = serve.get("port")
-        if serve.get("host") == "127.0.0.1":
+        port = service.get("port")
+        if service.get("host") == "127.0.0.1":
             self.remoteURL.setText("http://127.0.0.1:%s/v1（只在服务器上能用）" % port)
             self.remoteNote.setText("只听本机：别的机器连不上，用下面的隧道")
         else:
@@ -1031,12 +1185,12 @@ class MainWindow(QMainWindow):
             ips = "、".join(self.probe.get("ips") or [])
             self.remoteNote.setText("要这个端口能从外面访问（云服务器放行安全组 / 防火墙；AutoDL 这类经网关的机器直接连不上，用隧道或它的自定义服务端口）"
                                     + ("；服务器的内网 IP：%s" % ips if ips else ""))
-        tunnel = self.conn.tunnel_open(self.localPort.value())
-        self.tunnelURL.setText("http://127.0.0.1:%d/v1" % self.localPort.value() if tunnel else "")
-        self.tunnelURL.setPlaceholderText("点「开隧道」" if not tunnel else "")
+        tunnel = self.tunnels.get(service["id"])
+        self.tunnelURL.setText("http://127.0.0.1:%d/v1" % tunnel if tunnel else "")
+        self.tunnelURL.setPlaceholderText("" if tunnel else "点「开隧道」")
         self.tunnelButton.setText("关隧道" if tunnel else "开隧道")
-        self.modelName.setText(serve.get("name") or "")
-        self.keyText.setText(serve.get("key") or "")
+        self.modelName.setText(service.get("name") or "")
+        self.keyText.setText(service.get("key") or "")
 
     # ── 轮询服务器 ──
 
@@ -1057,6 +1211,7 @@ class MainWindow(QMainWindow):
             self.polling = False
             status, job, tail = result
             self._apply_jobs(status.get("jobs") or {})
+            self._apply_services(status.get("services") or {})
             if tail:
                 self.offsets[job] = tail["offset"]
                 self._apply_log(job, tail["text"])
@@ -1099,7 +1254,6 @@ class MainWindow(QMainWindow):
         self.jobs = jobs
         install = jobs.get("install") or {}
         download = jobs.get("download") or {}
-        serve = jobs.get("serve") or {}
         texts = {"running": "正在进行", "done": "完成", "failed": "失败", "stopped": "已停止"}
         self.installStatus.setText("%s%s" % (texts.get(install.get("status"), ""), "：" + install["message"] if install.get("message") else ""))
         self.installButton.setEnabled(install.get("status") != "running")
@@ -1113,22 +1267,10 @@ class MainWindow(QMainWindow):
             self._refresh_models()
         if install.get("status") in ("done", "failed") and (before.get("install") or {}).get("status") == "running":
             background(self.conn.agent, "probe", timeout=60, done=self._reprobe, failed=self.fail("读服务器信息失败"))
-        running = serve.get("status") == "running"
-        if running:
-            cards = "，显卡 %s" % ",".join(str(i) for i in serve.get("gpus") or []) if serve.get("gpus") else ""
-            if (serve.get("tp") or 1) > 1 or (serve.get("dp") or 1) > 1:
-                cards += "（TP %s × DP %s）" % (serve.get("tp") or 1, serve.get("dp") or 1)
-            self.serveStatus.setText("运行中：%s%s" % (serve.get("name"), cards) if serve.get("healthy") else "启动中（加载模型、编译，几分钟）…")
-        else:
-            self.serveStatus.setText({"failed": "没起来，看下面的日志", "stopped": "已停止"}.get(serve.get("status"), "没在跑"))
-            if self.conn and self.conn.tunnel_open(self.localPort.value()) and (before.get("serve") or {}).get("status") == "running":
-                self.conn.close_tunnel(self.localPort.value())
-        self.startButton.setEnabled(not running and bool((self.probe.get("engines") or {}).get(self.serveEngine.currentData())))
-        self.stopButton.setEnabled(running)
-        self._update_addresses()
+        self.startButton.setEnabled(bool(self.conn) and bool((self.probe.get("engines") or {}).get(self.serveEngine.currentData())))
         # 没在看日志时，跟着在跑的任务看
         if not self.watch:
-            for job in ("download", "install", "serve"):
+            for job in ("download", "install"):
                 if (jobs.get(job) or {}).get("status") == "running":
                     self.watch = job
                     break

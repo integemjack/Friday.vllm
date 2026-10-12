@@ -7,13 +7,14 @@
     agent.py download --base D --repo ORG/NAME --source modelscope|huggingface|hf-mirror --dir 目标目录
                                                        后台任务：多连接分段下载、断点续传、按 sha256 校验
     agent.py models  --dirs 目录1,目录2                   列出已下好的模型（有 config.json 和 *.safetensors 的目录），JSON
-    agent.py serve   --base D [--engine vllm|sglang] --model 目录 ...   后台起服务，记下 pid / 端口 / 密钥
-    agent.py stop    --base D [--job serve|install|download]   停掉
-    agent.py status  --base D                          各任务的状态 + 服务健康检查，JSON
-    agent.py tail    --base D --job J --offset N         从第 N 个字节起读任务日志，JSON
+    agent.py serve   --base D [--engine vllm|sglang] --model 目录 ...   后台起一个服务（可以同时有好几个），记下 pid / 端口 / 显卡 / 密钥
+    agent.py stop    --base D --job install|download|serve [--id 服务]   停掉
+    agent.py forget  --base D --id 服务                   删掉停了的服务的记录和日志
+    agent.py status  --base D                          各任务、各服务的状态（含健康检查），JSON
+    agent.py tail    --base D --job install|download|serve:<服务> --offset N   从第 N 个字节起读日志，JSON
 
 工作目录 D 的布局：env/（vLLM 的虚拟环境）、env-sglang/（SGLang 的）、uv-cache/、models/（缺省下载位置）、
-logs/<任务>.log、state/<任务>.json。
+logs/<任务>.log、state/<任务>.json；服务各一份：state/services/<id>.json、logs/serve-<id>.log。
 后台任务用 setsid 脱离 SSH 会话：界面关了、断线了照样跑完，重连后接着看。
 """
 import argparse
@@ -151,6 +152,9 @@ def disk_free(path):
 
 def gpus():
     # index 是 nvidia-smi 的编号（按 PCI 总线顺序）；启动时设 CUDA_DEVICE_ORDER=PCI_BUS_ID，CUDA_VISIBLE_DEVICES 才和它对得上
+    fake = os.environ.get("FRIDAY_VLLM_FAKE_GPUS")   # 测试用：没有显卡的机器上假装有（JSON，字段同下）
+    if fake:
+        return json.loads(fake)
     code, out, _ = run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,compute_cap",
                         "--format=csv,noheader,nounits"])
     result = []
@@ -213,6 +217,7 @@ def cmd_probe(args):
         "engines": {engine: engine_version(args.base, engine) for engine in ENGINES},
         "archs": {engine: engine_archs(args.base, engine) for engine in ENGINES},
         "jobs": jobs_status(args.base),
+        "services": services_status(args.base),
     }
     emit(info)
 
@@ -261,16 +266,65 @@ def finish_job(base, job, ok, message="", **extra):
 def jobs_status(base):
     p = paths(base)
     result = {}
-    for job in ("install", "download", "serve"):
+    for job in ("install", "download"):
         state = read_json(os.path.join(p["state"], job + ".json"))
         if not state:
             continue
         if state.get("status") == "running" and not alive(state.get("pid")):
             state["status"] = "failed"
             state["message"] = state.get("message") or "进程不在了（被杀掉或机器重启）"
-        if job == "serve" and state.get("status") == "running":
-            state["healthy"] = healthy(state.get("port"))
         result[job] = state
+    return result
+
+
+# ── 服务（可以同时有好几个：不同的模型、不同的显卡、不同的端口）──
+
+def services_dir(base):
+    return os.path.join(paths(base)["state"], "services")
+
+
+def service_path(base, sid):
+    return os.path.join(services_dir(base), sid + ".json")
+
+
+def service_id(name, port):
+    return "%s-%s" % (re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "service", port)
+
+
+def migrate_single_service(base):
+    """0.1 只有一个服务（state/serve.json）：挪成 services/ 下的一份"""
+    old = os.path.join(paths(base)["state"], "serve.json")
+    state = read_json(old)
+    if not state:
+        return
+    sid = service_id(state.get("name") or "service", state.get("port") or 0)
+    state["id"] = sid
+    write_json(service_path(base, sid), state)
+    os.remove(old)
+
+
+def services_status(base):
+    migrate_single_service(base)
+    result = {}
+    directory = services_dir(base)
+    if not os.path.isdir(directory):
+        return result
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        state = read_json(os.path.join(directory, name))
+        if not state:
+            continue
+        sid = state.get("id") or name[:-5]
+        state["id"] = sid
+        if state.get("status") == "running":
+            if not alive(state.get("pid")):
+                state["status"] = "failed"
+                state["message"] = state.get("message") or "进程退出了（看日志）"
+                write_json(os.path.join(directory, name), state)
+            else:
+                state["healthy"] = healthy(state.get("port"))
+        result[sid] = state
     return result
 
 
@@ -283,11 +337,14 @@ def healthy(port):
 
 
 def cmd_status(args):
-    emit({"jobs": jobs_status(args.base), "gpus": gpus()})
+    emit({"jobs": jobs_status(args.base), "services": services_status(args.base), "gpus": gpus()})
 
 
 def cmd_tail(args):
-    path = os.path.join(paths(args.base)["logs"], args.job + ".log")
+    if args.job.startswith("serve:"):
+        path = (read_json(service_path(args.base, args.job[6:])) or {}).get("log") or ""
+    else:
+        path = os.path.join(paths(args.base)["logs"], args.job + ".log")
     try:
         size = os.path.getsize(path)
         offset = args.offset if 0 <= args.offset <= size else max(0, size - 65536)
@@ -301,7 +358,14 @@ def cmd_tail(args):
 
 def cmd_stop(args):
     job = args.job or "serve"
-    path = os.path.join(paths(args.base)["state"], job + ".json")
+    if job == "serve":
+        if not args.id:
+            emit({"ok": False, "error": "停哪个服务？要 --id"})
+            return
+        migrate_single_service(args.base)
+        path = service_path(args.base, args.id)
+    else:
+        path = os.path.join(paths(args.base)["state"], job + ".json")
     state = read_json(path, {})
     pid = state.get("pid")
     if not pid or not alive(pid):
@@ -327,6 +391,21 @@ def cmd_stop(args):
     state.update({"status": "stopped", "finished": time.time(), "message": "已停止"})
     write_json(path, state)
     emit({"ok": True, "message": "已停止"})
+
+
+def cmd_forget(args):
+    path = service_path(args.base, args.id)
+    state = read_json(path)
+    if not state:
+        emit({"ok": True})
+        return
+    if state.get("status") == "running" and alive(state.get("pid")):
+        emit({"ok": False, "error": "服务还在跑，先停掉"})
+        return
+    os.remove(path)
+    if state.get("log") and os.path.exists(state["log"]):
+        os.remove(state["log"])
+    emit({"ok": True})
 
 
 # ── install ──
@@ -781,10 +860,15 @@ def cmd_serve(args):
     if not engine_version(args.base, args.engine):
         emit({"ok": False, "error": "还没装 %s" % engine["title"]})
         return
-    state = read_json(os.path.join(p["state"], "serve.json"), {})
-    if state.get("status") == "running" and alive(state.get("pid")):
-        emit({"ok": False, "error": "服务已经在跑（pid %s，端口 %s），先停掉" % (state.get("pid"), state.get("port"))})
+    sid = service_id(args.name, args.port)
+    running = {k: v for k, v in services_status(args.base).items() if v.get("status") == "running"}
+    if sid in running:
+        emit({"ok": False, "error": "服务 %s 已经在跑，先停掉" % sid})
         return
+    for other in running.values():
+        if int(other.get("port") or 0) == args.port:
+            emit({"ok": False, "error": "端口 %d 已经给服务 %s 用了，换一个端口" % (args.port, other["id"])})
+            return
     cards = gpus()
     if not cards:
         emit({"ok": False, "error": "没检测到 NVIDIA 显卡（nvidia-smi 不能用）：%s 要显卡才能跑。AutoDL 上要用「有卡模式」开机" % engine["title"]})
@@ -801,6 +885,12 @@ def cmd_serve(args):
         emit({"ok": False, "error": "没有这几张显卡：%s（有 %s）" % (missing, known)})
         return
     tp, dp = max(1, args.tp), max(1, args.dp)
+    # 别的服务正用着的卡不能再用（显存会被两边抢光，两个都起不来）
+    for other in running.values():
+        overlap = sorted(set(other.get("gpus") or []) & set(chosen[:tp * dp]))
+        if overlap:
+            emit({"ok": False, "error": "显卡 %s 正给服务 %s 用着：换别的卡，或先停掉它" % ("、".join(str(i) for i in overlap), other["id"])})
+            return
     if tp * dp > len(chosen):
         emit({"ok": False, "error": "TP %d × DP %d 要 %d 张显卡，只选了 %d 张" % (tp, dp, tp * dp, len(chosen))})
         return
@@ -840,7 +930,7 @@ def cmd_serve(args):
     if args.extra:
         cmd += args.extra.split()
     os.makedirs(p["logs"], exist_ok=True)
-    log_path = os.path.join(p["logs"], "serve.log")
+    log_path = os.path.join(p["logs"], "serve-%s.log" % sid)
     environment = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_NO_USAGE_STATS="1", DO_NOT_TRACK="1")
     # torch.compile 的缓存放工作目录里：第二次启动快很多
     environment.setdefault("VLLM_CACHE_ROOT", os.path.join(args.base, "vllm-cache"))
@@ -851,11 +941,11 @@ def cmd_serve(args):
         out.flush()
         child = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                                  cwd=args.base, env=environment)
-    write_json(os.path.join(p["state"], "serve.json"),
-               {"status": "running", "pid": child.pid, "started": time.time(), "log": log_path, "port": args.port, "host": args.host,
+    write_json(service_path(args.base, sid),
+               {"id": sid, "status": "running", "pid": child.pid, "started": time.time(), "log": log_path, "port": args.port, "host": args.host,
                 "engine": args.engine, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp,
                 "key": args.key, "name": args.name, "model": model, "tool_parser": tool, "reasoning_parser": reasoning})
-    emit({"ok": True, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp})
+    emit({"ok": True, "id": sid, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp})
 
 
 # ── 入口 ──
@@ -903,6 +993,9 @@ def main():
     command.add_argument("--dp", type=int, default=1, help="数据并行：开几份副本")
     command = add("stop", cmd_stop)
     command.add_argument("--job", default="serve")
+    command.add_argument("--id", default="")
+    command = add("forget", cmd_forget)
+    command.add_argument("--id", required=True)
     command = add("tail", cmd_tail)
     command.add_argument("--job", required=True)
     command.add_argument("--offset", type=int, default=-1)
