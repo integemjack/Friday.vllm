@@ -1291,7 +1291,7 @@ def selftest(path):
     agent = Path(__file__).resolve().parent / "agent" / "agent.py"
     app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
-    ok = agent.is_file() and b"def cmd_probe" in agent.read_bytes() and window.tabs.count() == 4
+    ok = agent.is_file() and b"def cmd_probe" in agent.read_bytes() and window.tabs.count() == 5
     with open(path, "w", encoding="utf-8") as f:
         f.write("ok\n" if ok else "failed: agent=%s\n" % agent)
     return 0 if ok else 1
