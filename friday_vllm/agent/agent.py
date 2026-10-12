@@ -65,6 +65,41 @@ SOURCES = {
 DEFAULT_EXCLUDE = ["*.gguf", "original/*", "*.pth", "*.pt", "*.msgpack", "*.h5", "*.onnx", "onnx/*", "openvino/*"]
 CHUNK = 64 << 20          # 分段下载每段 64 MB
 CONNECTIONS = 16          # 同时开的连接
+DNS_TTL = 300             # 域名解析结果缓存多久（秒）
+
+
+def cache_dns():
+    """下载时缓存域名解析：16 个连接、每段都查 modelscope.cn 和它跳转到的 CDN，查得太多；
+    AutoDL 的 DNS 只等 1 秒、不重试（resolv.conf 的 timeout:1 attempts:1），常常报 Temporary failure in name resolution。
+    几分钟内同一个域名不再查；查不到时用上一次查到的"""
+    real = socket.getaddrinfo
+    cache = {}
+
+    def cached(host, *args, **kwargs):
+        key = (host, args, tuple(sorted(kwargs.items())))
+        hit = cache.get(key)
+        if hit and time.time() - hit[0] < DNS_TTL:
+            return hit[1]
+        try:
+            result = real(host, *args, **kwargs)
+        except socket.gaierror:
+            if hit:
+                return hit[1]
+            raise
+        cache[key] = (time.time(), result)
+        return result
+
+    socket.getaddrinfo = cached
+
+
+def final_url(url):
+    """跟着跳转找到真正的下载地址（魔搭的 resolve 会跳到 CDN 上带签名的地址）：之后各段直接用它，少一半请求"""
+    request = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": "friday-vllm/" + VERSION})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.geturl() or url
+    except Exception:  # noqa: BLE001
+        return url
 
 
 # ── 小工具 ──
@@ -602,8 +637,9 @@ class Progress:
                 emit({"event": "progress", "done": self.done, "total": self.total, "speed": speed, "file": name})
 
 
-def fetch_range(url, start, end, out_path, progress, name, stop):
-    """把 [start, end] 写进 out_path 的同一位置；断了从断开的地方接着下（CDN 常常一段只给一部分就断开），连着失败才放弃"""
+def fetch_range(source, start, end, out_path, progress, name, stop):
+    """把 [start, end] 写进 out_path 的同一位置；断了从断开的地方接着下（CDN 常常一段只给一部分就断开），连着失败才放弃。
+    source = {"url": 跳转后的地址, "origin": 原地址}：跳转后的签名地址过期（403 / 410）时换回原地址、重新跳"""
     position = start
     failures = 0
     while position <= end:
@@ -611,6 +647,7 @@ def fetch_range(url, start, end, out_path, progress, name, stop):
             return False
         before = position
         try:
+            url = source["url"]
             request = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (position, end), "User-Agent": "friday-vllm/" + VERSION})
             with urllib.request.urlopen(request, timeout=60) as response, open(out_path, "r+b") as f:
                 if response.status != 206 and (position != 0 or response.headers.get("Content-Length") not in (None, str(end - position + 1))):
@@ -626,13 +663,17 @@ def fetch_range(url, start, end, out_path, progress, name, stop):
             if position <= end:
                 raise RuntimeError("连接断开（这一段下到 %d / %d 字节）" % (position - start, end - start + 1))
         except Exception as error:  # noqa: BLE001
+            if isinstance(error, urllib.error.HTTPError) and error.code in (403, 410) and source["url"] != source["origin"]:
+                source["url"] = final_url(source["origin"])
             # 有进展就不算失败：接着下
             failures = 0 if position > before else failures + 1
             if failures >= 12:
                 log("%s 的 %d–%d 段连续失败 12 次，放弃：%s" % (name, start, end, str(error)[:120]))
                 return False
             if failures:
-                log("%s 的 %d–%d 段第 %d 次失败：%s" % (name, start, end, failures, str(error)[:120]))
+                # 偶尔断一下（DNS、CDN 卡一下）自动重试就好，连着 3 次以上才记
+                if failures >= 3:
+                    log("%s 的 %d–%d 段连续第 %d 次失败（自动重试）：%s" % (name, start, end, failures, str(error)[:120]))
                 time.sleep(min(30, 2 ** failures))
     return True
 
@@ -655,12 +696,13 @@ def download_file(source, repo, revision, item, target, progress, pool_size, sto
         progress.add(size, name)
         return True
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    url = file_url(source, repo, revision, name)
+    origin = file_url(source, repo, revision, name)
+    url = {"url": final_url(origin) if size > CHUNK else origin, "origin": origin}
     if size <= CHUNK:
         # 小文件：一次下完
         with open(part, "wb"):
             pass
-        ok = fetch_range(url, 0, max(size - 1, 0), part, progress, name, stop) if size else fetch_whole(url, part)
+        ok = fetch_range(url, 0, max(size - 1, 0), part, progress, name, stop) if size else fetch_whole(origin, part)
     else:
         if not os.path.exists(part) or os.path.getsize(part) != size:
             with open(part, "wb") as f:
@@ -727,6 +769,7 @@ def cmd_download(args):
         return start_job(args.base, "download", argv)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    cache_dns()
     try:
         target = os.path.abspath(os.path.expanduser(args.dir))
         log("列 %s 上 %s 的文件" % (args.source, args.repo))
