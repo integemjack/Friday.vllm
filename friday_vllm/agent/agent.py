@@ -150,17 +150,28 @@ def disk_free(path):
 # ── probe ──
 
 def gpus():
-    code, out, _ = run(["nvidia-smi", "--query-gpu=name,memory.total,memory.used,driver_version,compute_cap",
+    # index 是 nvidia-smi 的编号（按 PCI 总线顺序）；启动时设 CUDA_DEVICE_ORDER=PCI_BUS_ID，CUDA_VISIBLE_DEVICES 才和它对得上
+    code, out, _ = run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,compute_cap",
                         "--format=csv,noheader,nounits"])
     result = []
     if code != 0:
         return result
     for line in out.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 5:
-            result.append({"name": parts[0], "memory_total_mib": int(float(parts[1])), "memory_used_mib": int(float(parts[2])),
-                           "driver": parts[3], "compute_cap": parts[4]})
+        if len(parts) >= 6:
+            result.append({"index": int(parts[0]), "name": parts[1], "memory_total_mib": int(float(parts[2])),
+                           "memory_used_mib": int(float(parts[3])), "driver": parts[4], "compute_cap": parts[5]})
     return result
+
+
+def attention_heads(model_dir):
+    """模型的注意力头数（张量并行的份数要能整除它）；读不到为 0"""
+    config = read_json(os.path.join(model_dir, "config.json"), {})
+    for source in (config, config.get("text_config") or {}, config.get("llm_config") or {}):
+        heads = source.get("num_attention_heads")
+        if heads:
+            return int(heads)
+    return 0
 
 
 def engine_env(base, engine):
@@ -699,6 +710,7 @@ def describe_model(directory):
         "model_type": config.get("model_type") or text.get("model_type") or "",
         "quantization": method,
         "max_len": config.get("max_position_embeddings") or text.get("max_position_embeddings") or 0,
+        "heads": attention_heads(directory),
         "complete": not partial,
     }
 
@@ -773,12 +785,29 @@ def cmd_serve(args):
     if state.get("status") == "running" and alive(state.get("pid")):
         emit({"ok": False, "error": "服务已经在跑（pid %s，端口 %s），先停掉" % (state.get("pid"), state.get("port"))})
         return
-    if not gpus():
+    cards = gpus()
+    if not cards:
         emit({"ok": False, "error": "没检测到 NVIDIA 显卡（nvidia-smi 不能用）：%s 要显卡才能跑。AutoDL 上要用「有卡模式」开机" % engine["title"]})
         return
     model = os.path.abspath(os.path.expanduser(args.model))
     if not os.path.exists(os.path.join(model, "config.json")):
         emit({"ok": False, "error": "%s 不是模型目录（没有 config.json）" % model})
+        return
+    # 多显卡：用哪几张（不给 = 全部）、张量并行 TP（一份模型切到几张卡上）× 数据并行 DP（开几份副本）
+    known = [c["index"] for c in cards]
+    chosen = [int(x) for x in args.gpus.split(",") if x.strip()] if args.gpus else known
+    missing = [i for i in chosen if i not in known]
+    if missing:
+        emit({"ok": False, "error": "没有这几张显卡：%s（有 %s）" % (missing, known)})
+        return
+    tp, dp = max(1, args.tp), max(1, args.dp)
+    if tp * dp > len(chosen):
+        emit({"ok": False, "error": "TP %d × DP %d 要 %d 张显卡，只选了 %d 张" % (tp, dp, tp * dp, len(chosen))})
+        return
+    heads = attention_heads(model)
+    if tp > 1 and heads and heads % tp:
+        emit({"ok": False, "error": "张量并行 TP %d 要能整除模型的注意力头数 %d：换成 %s" % (
+            tp, heads, "、".join(str(n) for n in (1, 2, 4, 8, 16) if heads % n == 0 and n <= len(chosen)))})
         return
     tool, reasoning = parsers_for(model, args.engine)
     if args.tool_parser != "auto":
@@ -788,7 +817,8 @@ def cmd_serve(args):
     if args.engine == "sglang":
         # SGLang：RadixAttention 前缀缓存默认开着；显存占比是给权重 + KV 的静态部分
         cmd = [python, "-m", "sglang.launch_server", "--model-path", model, "--served-model-name", args.name, "--host", args.host,
-               "--port", str(args.port), "--mem-fraction-static", str(args.gpu_util), "--max-running-requests", str(args.max_seqs)]
+               "--port", str(args.port), "--mem-fraction-static", str(args.gpu_util), "--max-running-requests", str(args.max_seqs),
+               "--tp-size", str(tp), "--dp-size", str(dp)]
         if args.max_len:
             cmd += ["--context-length", str(args.max_len)]
         if tool:
@@ -796,7 +826,9 @@ def cmd_serve(args):
     else:
         cmd = [os.path.join(engine_env(args.base, args.engine), "bin", "vllm"), "serve", model, "--served-model-name", args.name,
                "--host", args.host, "--port", str(args.port), "--gpu-memory-utilization", str(args.gpu_util),
-               "--max-num-seqs", str(args.max_seqs), "--enable-prefix-caching"]
+               "--max-num-seqs", str(args.max_seqs), "--enable-prefix-caching", "--tensor-parallel-size", str(tp)]
+        if dp > 1:
+            cmd += ["--data-parallel-size", str(dp)]
         if args.max_len:
             cmd += ["--max-model-len", str(args.max_len)]
         if tool:
@@ -812,6 +844,8 @@ def cmd_serve(args):
     environment = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_NO_USAGE_STATS="1", DO_NOT_TRACK="1")
     # torch.compile 的缓存放工作目录里：第二次启动快很多
     environment.setdefault("VLLM_CACHE_ROOT", os.path.join(args.base, "vllm-cache"))
+    environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in chosen[:tp * dp])
     with open(log_path, "w") as out:
         out.write("$ " + " ".join(c if args.key is None or c != args.key else "***" for c in cmd) + "\n")
         out.flush()
@@ -819,9 +853,9 @@ def cmd_serve(args):
                                  cwd=args.base, env=environment)
     write_json(os.path.join(p["state"], "serve.json"),
                {"status": "running", "pid": child.pid, "started": time.time(), "log": log_path, "port": args.port, "host": args.host,
-                "engine": args.engine,
+                "engine": args.engine, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp,
                 "key": args.key, "name": args.name, "model": model, "tool_parser": tool, "reasoning_parser": reasoning})
-    emit({"ok": True, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning})
+    emit({"ok": True, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp})
 
 
 # ── 入口 ──
@@ -864,6 +898,9 @@ def main():
     command.add_argument("--tool-parser", default="auto")
     command.add_argument("--reasoning-parser", default="auto")
     command.add_argument("--extra", default="")
+    command.add_argument("--gpus", default="", help="用哪几张显卡（nvidia-smi 的编号，逗号分开；不给 = 全部）")
+    command.add_argument("--tp", type=int, default=1, help="张量并行：一份模型切到几张卡上")
+    command.add_argument("--dp", type=int, default=1, help="数据并行：开几份副本")
     command = add("stop", cmd_stop)
     command.add_argument("--job", default="serve")
     command = add("tail", cmd_tail)

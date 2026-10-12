@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
         cards = p.get("gpus") or []
         if cards:
             for card in cards:
-                rows.append(("显卡", "%s，显存 %.1f GB（已用 %.1f GB），驱动 %s，算力 %s" % (
+                rows.append(("显卡 %s" % card.get("index", ""), "%s，显存 %.1f GB（已用 %.1f GB），驱动 %s，算力 %s" % (
                     card["name"], card["memory_total_mib"] / 1024, card["memory_used_mib"] / 1024, card["driver"], card["compute_cap"])))
         else:
             rows.append(("显卡", "<span style='color:#c33'>没找到 NVIDIA 显卡（vLLM、SGLang 都要 NVIDIA 显卡；AutoDL 无卡模式下可以先装）</span>"))
@@ -376,6 +376,7 @@ class MainWindow(QMainWindow):
         self.driverWarning.setText(warning)
         self.driverWarning.setVisible(bool(warning))
         self._apply_filters()
+        self._rebuild_gpus(cards)
         self._apply_jobs(p.get("jobs") or {})
 
     # ── 安装 ──
@@ -509,7 +510,7 @@ class MainWindow(QMainWindow):
         filterRow.addWidget(self.quantFilter)
         filterRow.addSpacing(12)
         self.fitsGpu = QCheckBox("只看这台显卡跑得动的")
-        self.fitsGpu.setToolTip("模型大小放得进显存（留一成给 KV 缓存），量化方式这张卡也支持（NVFP4 要 Blackwell，FP8 要算力 8.9 起）")
+        self.fitsGpu.setToolTip("模型大小放得进显存（多张卡按切开放算，留一成给 KV 缓存），量化方式这些卡也支持（NVFP4 要 Blackwell，FP8 要算力 8.9 起）")
         self.fitsGpu.toggled.connect(self._apply_filters)
         filterRow.addWidget(self.fitsGpu)
         self.engineSupported = QCheckBox("只看装好的引擎支持的")
@@ -708,6 +709,38 @@ class MainWindow(QMainWindow):
         self.serveModel = QComboBox()
         self.serveModel.currentIndexChanged.connect(self._model_changed)
         form.addRow("模型", self.serveModel)
+        # 多显卡：勾用哪几张；张量并行 TP（一份模型切到几张卡上，大模型一张放不下时用）× 数据并行 DP（开几份副本，小模型多卡时提吞吐）
+        self.gpuChecks = []
+        # 每行 4 张（8 卡机一行排不下）
+        self.gpuGrid = QGridLayout()
+        self.gpuGrid.setContentsMargins(0, 0, 0, 0)
+        self.gpuEmpty = QLabel("连上服务器后列出它的显卡")
+        self.gpuEmpty.setStyleSheet("color: gray")
+        self.gpuGrid.addWidget(self.gpuEmpty, 0, 0)
+        gpuWidget = QWidget()
+        gpuWidget.setLayout(self.gpuGrid)
+        form.addRow("显卡", gpuWidget)
+        self.tpSize = QSpinBox()
+        self.tpSize.setRange(1, 64)
+        self.tpSize.setToolTip("张量并行：一份模型切到几张卡上（要能整除模型的注意力头数，一般是 1、2、4、8）")
+        self.dpSize = QSpinBox()
+        self.dpSize.setRange(1, 64)
+        self.dpSize.setToolTip("数据并行：开几份副本，每份占 TP 张卡；并发请求分给各份，吞吐跟着翻倍")
+        self.tpSize.valueChanged.connect(self._parallel_summary)
+        self.dpSize.valueChanged.connect(self._parallel_summary)
+        autoParallel = QPushButton("自动")
+        autoParallel.setToolTip("按模型大小和单卡显存算：一张卡放得下就 TP 1、每张卡一份；放不下就切到能放下的最少张数")
+        autoParallel.clicked.connect(self._auto_parallel)
+        self.parallelText = QLabel()
+        self.parallelText.setWordWrap(True)
+        parallelRow = QHBoxLayout()
+        parallelRow.addWidget(QLabel("张量并行 TP"))
+        parallelRow.addWidget(self.tpSize)
+        parallelRow.addWidget(QLabel("× 副本 DP"))
+        parallelRow.addWidget(self.dpSize)
+        parallelRow.addWidget(autoParallel)
+        parallelRow.addWidget(self.parallelText, 1)
+        form.addRow("并行", parallelRow)
         self.serveName = QLineEdit()
         self.serveName.setPlaceholderText("Friday 里填的模型名")
         form.addRow("模型名", self.serveName)
@@ -757,7 +790,7 @@ class MainWindow(QMainWindow):
         parserRow.addWidget(self.reasoningParser, 1)
         form.addRow("解析", parserRow)
         self.extraArgs = QLineEdit(self.settings.value("extraArgs", ""))
-        self.extraArgs.setPlaceholderText("其他启动参数，例如 vLLM 的 --enforce-eager（启动快、跑得慢）、SGLang 的 --tp 2")
+        self.extraArgs.setPlaceholderText("其他启动参数，例如 vLLM 的 --enforce-eager（启动快、跑得慢）、SGLang 的 --enable-torch-compile")
         form.addRow("其他参数", self.extraArgs)
         layout.addLayout(form)
         buttons = QHBoxLayout()
@@ -832,6 +865,85 @@ class MainWindow(QMainWindow):
         path = self.serveModel.currentData() or ""
         if path:
             self.serveName.setText(os.path.basename(path.rstrip("/")).lower())
+        self._auto_parallel()
+
+    # ── 多显卡 ──
+
+    def _rebuild_gpus(self, cards):
+        """运行页的显卡勾选：每张卡一个；别人占着一成以上显存的缺省不勾"""
+        for check in self.gpuChecks:
+            self.gpuGrid.removeWidget(check)
+            check.deleteLater()
+        self.gpuChecks = []
+        self.gpuEmpty.setVisible(not cards)
+        for position, card in enumerate(cards):
+            used = card["memory_used_mib"] / max(card["memory_total_mib"], 1)
+            name = card["name"].replace("NVIDIA ", "").replace("GeForce ", "").replace(" Blackwell Server Edition", "")
+            check = QCheckBox("%s：%s · %.0f GB%s" % (card.get("index", position), name, card["memory_total_mib"] / 1024,
+                                                    "（已用 %.1f GB）" % (card["memory_used_mib"] / 1024) if used > 0.02 else ""))
+            check.setToolTip(card["name"])
+            check.setProperty("index", card.get("index", position))
+            check.setProperty("memory", card["memory_total_mib"] * 1024 * 1024)
+            check.setChecked(used < 0.1)
+            check.toggled.connect(self._auto_parallel)
+            self.gpuGrid.addWidget(check, position // 4, position % 4)
+            self.gpuChecks.append(check)
+        self._auto_parallel()
+
+    def _chosen_gpus(self):
+        return [check for check in self.gpuChecks if check.isChecked()]
+
+    def _selected_model(self):
+        path = self.serveModel.currentData()
+        return next((m for m in self.models if m["path"] == path), None)
+
+    def _auto_parallel(self, *_):
+        chosen = self._chosen_gpus()
+        if not chosen:
+            self._parallel_summary()
+            return
+        model = self._selected_model() or {}
+        size = model.get("size") or 0
+        heads = model.get("heads") or 0
+        memory = min(check.property("memory") for check in chosen)
+        # 权重最多占切开后显存的八成（剩下给 KV 缓存）；TP 取 2 的幂、要能整除注意力头数
+        tp = 1
+        while tp * 2 <= len(chosen) and size > tp * memory * 0.8 and (not heads or heads % (tp * 2) == 0):
+            tp *= 2
+        for spin, value in ((self.tpSize, tp), (self.dpSize, max(1, len(chosen) // tp))):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        self._parallel_summary()
+
+    def _parallel_summary(self, *_):
+        chosen = self._chosen_gpus()
+        tp, dp = self.tpSize.value(), self.dpSize.value()
+        if not self.gpuChecks:
+            self.parallelText.setText("")
+            return
+        if not chosen:
+            self.parallelText.setText("<span style='color:#c33'>至少勾一张卡</span>")
+            return
+        model = self._selected_model() or {}
+        notes = []
+        if tp * dp > len(chosen):
+            notes.append("<span style='color:#c33'>TP × DP = %d，只勾了 %d 张卡</span>" % (tp * dp, len(chosen)))
+        heads = model.get("heads") or 0
+        if heads and heads % tp:
+            notes.append("<span style='color:#c33'>TP 要能整除注意力头数 %d</span>" % heads)
+        size = model.get("size") or 0
+        memory = min(check.property("memory") for check in chosen) * tp
+        if size and size > memory * 0.9:
+            notes.append("<span style='color:#c33'>模型 %s，%d 张卡共 %s，放不下：加大 TP</span>" % (human(size), tp, human(memory)))
+        if not notes:
+            if tp == 1 and dp == 1:
+                notes.append("用 1 张卡")
+            else:
+                notes.append("用 %d 张卡：每份模型%s，开 %d 份副本" % (tp * dp, "切到 %d 张卡上" % tp if tp > 1 else "放一张卡", dp))
+            if tp * dp < len(chosen):
+                notes.append("（勾了 %d 张，空着 %d 张）" % (len(chosen), len(chosen) - tp * dp))
+        self.parallelText.setText("".join(notes))
 
     def _start_serve(self):
         path = self.serveModel.currentData()
@@ -849,6 +961,13 @@ class MainWindow(QMainWindow):
                 "--extra", self.extraArgs.text().strip()]
         if self.apiKey.text().strip():
             args += ["--key", self.apiKey.text().strip()]
+        chosen = self._chosen_gpus()
+        if self.gpuChecks:
+            if not chosen:
+                QMessageBox.information(self, APP, "至少勾一张显卡")
+                return
+            args += ["--gpus", ",".join(str(check.property("index")) for check in chosen),
+                     "--tp", self.tpSize.value(), "--dp", self.dpSize.value()]
         self.offsets["serve"] = 0
         self.watch = "serve"
         self.log("启动 %s：%s（端口 %d）" % (ENGINES[engine][0], path, self.servePort.value()))
@@ -996,7 +1115,10 @@ class MainWindow(QMainWindow):
             background(self.conn.agent, "probe", timeout=60, done=self._reprobe, failed=self.fail("读服务器信息失败"))
         running = serve.get("status") == "running"
         if running:
-            self.serveStatus.setText("运行中：%s" % serve.get("name") if serve.get("healthy") else "启动中（加载模型、编译，几分钟）…")
+            cards = "，显卡 %s" % ",".join(str(i) for i in serve.get("gpus") or []) if serve.get("gpus") else ""
+            if (serve.get("tp") or 1) > 1 or (serve.get("dp") or 1) > 1:
+                cards += "（TP %s × DP %s）" % (serve.get("tp") or 1, serve.get("dp") or 1)
+            self.serveStatus.setText("运行中：%s%s" % (serve.get("name"), cards) if serve.get("healthy") else "启动中（加载模型、编译，几分钟）…")
         else:
             self.serveStatus.setText({"failed": "没起来，看下面的日志", "stopped": "已停止"}.get(serve.get("status"), "没在跑"))
             if self.conn and self.conn.tunnel_open(self.localPort.value()) and (before.get("serve") or {}).get("status") == "running":
