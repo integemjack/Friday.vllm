@@ -375,6 +375,7 @@ class MainWindow(QMainWindow):
             warning = "现在没检测到 NVIDIA 显卡（AutoDL 无卡模式？）：可以先装，运行时要带显卡开机"
         self.driverWarning.setText(warning)
         self.driverWarning.setVisible(bool(warning))
+        self._apply_filters()
         self._apply_jobs(p.get("jobs") or {})
 
     # ── 安装 ──
@@ -489,8 +490,41 @@ class MainWindow(QMainWindow):
         searchButton.clicked.connect(self._search)
         searchRow.addWidget(searchButton)
         remoteLayout.addLayout(searchRow)
-        self.resultTable = QTableWidget(0, 5)
-        self.resultTable.setHorizontalHeaderLabels(["仓库", "大小", "下载量", "架构", "装好的引擎支持吗"])
+        filterRow = QHBoxLayout()
+        filterRow.addWidget(QLabel("排序"))
+        self.sortBy = QComboBox()
+        for key, (title, _modelscope, _huggingface) in catalog.SORTS.items():
+            self.sortBy.addItem(title, key)
+        self.sortBy.addItem("大小（从小到大）", "size-asc")
+        self.sortBy.addItem("大小（从大到小）", "size-desc")
+        self.sortBy.currentIndexChanged.connect(self._sort_changed)
+        filterRow.addWidget(self.sortBy)
+        filterRow.addSpacing(12)
+        filterRow.addWidget(QLabel("量化"))
+        self.quantFilter = QComboBox()
+        self.quantFilter.addItem("全部", "")
+        for name in catalog.QUANT_NAMES:
+            self.quantFilter.addItem(name, name)
+        self.quantFilter.currentIndexChanged.connect(self._apply_filters)
+        filterRow.addWidget(self.quantFilter)
+        filterRow.addSpacing(12)
+        self.fitsGpu = QCheckBox("只看这台显卡跑得动的")
+        self.fitsGpu.setToolTip("模型大小放得进显存（留一成给 KV 缓存），量化方式这张卡也支持（NVFP4 要 Blackwell，FP8 要算力 8.9 起）")
+        self.fitsGpu.toggled.connect(self._apply_filters)
+        filterRow.addWidget(self.fitsGpu)
+        self.engineSupported = QCheckBox("只看装好的引擎支持的")
+        self.engineSupported.setToolTip("按装好的 vLLM / SGLang 支持的模型架构；架构不知道的（Hugging Face 的搜索结果）照样列")
+        self.engineSupported.toggled.connect(self._apply_filters)
+        filterRow.addWidget(self.engineSupported)
+        filterRow.addStretch(1)
+        self.resultCount = QLabel()
+        self.resultCount.setStyleSheet("color: gray")
+        filterRow.addWidget(self.resultCount)
+        remoteLayout.addLayout(filterRow)
+        self.resultsAll = []
+        self.results = []
+        self.resultTable = QTableWidget(0, 7)
+        self.resultTable.setHorizontalHeaderLabels(["仓库", "量化", "大小", "下载量", "更新", "架构", "装好的引擎支持吗"])
         self._table_style(self.resultTable)
         self.resultTable.itemSelectionChanged.connect(self._pick_result)
         remoteLayout.addWidget(self.resultTable)
@@ -570,23 +604,71 @@ class MainWindow(QMainWindow):
     def _search(self):
         source = self.source.currentData()
         text = self.query.text()
-        self.log("在%s搜「%s」" % (catalog.SOURCES[source][0], text or "常用"))
-        background(catalog.search, source, text, done=self._show_results, failed=self.fail("搜索失败"))
+        # 相关度、下载量、最近更新、收藏数交给搜索接口排（一页 100 个，排完再取）；按大小在本机排
+        order = self.sortBy.currentData()
+        sort = order if order in catalog.SORTS else "default"
+        self.log("在%s搜「%s」（按%s）" % (catalog.SOURCES[source][0], text or "常用", self.sortBy.currentText()))
+        background(catalog.search, source, text, sort, done=self._show_results, failed=self.fail("搜索失败"))
+
+    def _sort_changed(self, *_):
+        # 交给接口排的要重新搜（排在前 100 个以外的这样才看得到）；按大小的直接在搜到的里面排
+        if self.sortBy.currentData() in catalog.SORTS and self.query.text().strip() and self.resultsAll:
+            self._search()
+        else:
+            self._apply_filters()
 
     def _show_results(self, models):
-        archs = {e: set(a or []) for e, a in (self.probe.get("archs") or {}).items() if a}
+        self.resultsAll = models
+        self._apply_filters()
+        if not models:
+            self.log("没搜到（GGUF、MLX 这类 vLLM / SGLang 用不了的已经去掉了）")
+
+    def _engine_archs(self):
+        """装好的引擎各自支持的架构（没装、没读到的不算）"""
+        engines = self.probe.get("engines") or {}
+        return {e: set(a) for e, a in (self.probe.get("archs") or {}).items() if a and engines.get(e) and e in ENGINES}
+
+    def _apply_filters(self, *_):
+        models = list(self.resultsAll)
+        quant = self.quantFilter.currentData()
+        if quant:
+            models = [m for m in models if m.quant == quant]
+        cards = self.probe.get("gpus") or []
+        self.fitsGpu.setEnabled(bool(cards))
+        if not cards:
+            self.fitsGpu.setToolTip("没检测到这台服务器的显卡（没连上，或 AutoDL 无卡模式）")
+        if self.fitsGpu.isChecked() and cards:
+            memory = sum(c["memory_total_mib"] for c in cards) * 1024 * 1024 * 0.9
+            try:
+                capability = min(float(c["compute_cap"]) for c in cards)
+            except ValueError:
+                capability = 0.0
+            models = [m for m in models if (not m.size or m.size <= memory) and capability >= catalog.QUANT_MIN_CAP.get(m.quant, 0)]
+        archs = self._engine_archs()
+        self.engineSupported.setEnabled(bool(archs))
+        if self.engineSupported.isChecked() and archs:
+            models = [m for m in models if not m.architectures or any(a in known for known in archs.values() for a in m.architectures)]
+        order = self.sortBy.currentData()
+        if order == "size-asc":
+            models.sort(key=lambda m: (m.size == 0, m.size))
+        elif order == "size-desc":
+            models.sort(key=lambda m: -m.size)
         self.results = models
         self.resultTable.setRowCount(len(models))
         for row, model in enumerate(models):
             supported = "—"
             if archs and model.architectures:
                 supported = "、".join("%s %s" % (ENGINES[e][0], "支持" if any(x in known for x in model.architectures) else "不支持")
-                                     for e, known in archs.items() if e in ENGINES)
-            values = [model.repo, human(model.size), str(model.downloads or ""), "、".join(model.architectures), supported]
+                                     for e, known in archs.items())
+            values = [model.repo, model.quant, human(model.size), str(model.downloads or ""),
+                      time.strftime("%Y-%m-%d", time.localtime(model.updated)) if model.updated else "—",
+                      "、".join(model.architectures), supported]
             for column, value in enumerate(values):
-                self.resultTable.setItem(row, column, QTableWidgetItem(value))
-        if not models:
-            self.log("没搜到（GGUF、MLX 这类 vLLM / SGLang 用不了的已经去掉了）")
+                item = QTableWidgetItem(value)
+                if column in (2, 3):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.resultTable.setItem(row, column, item)
+        self.resultCount.setText("显示 %d / 共 %d 个" % (len(models), len(self.resultsAll)) if self.resultsAll else "")
 
     def _pick_result(self):
         rows = self.resultTable.selectionModel().selectedRows()

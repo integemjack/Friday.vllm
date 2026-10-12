@@ -1,7 +1,7 @@
 """在本机查可下载的模型：魔搭（ModelScope）、Hugging Face（或 hf-mirror）。
 
-只列 vLLM 能用的：有 safetensors 权重的仓库（名字带 GGUF / MLX / ONNX 的排除）。下载在服务器上做（agent.py download），
-这里只负责搜索和看看仓库里有什么。
+只列 vLLM / SGLang 能用的：有 safetensors 权重的仓库（名字带 GGUF / MLX / ONNX 的排除）。下载在服务器上做（agent.py download），
+这里只负责搜索、排序和看看仓库里有什么；筛选（量化、显存放不放得下、引擎支不支持）在界面上对搜到的结果做。
 """
 import json
 import re
@@ -13,8 +13,29 @@ SOURCES = {
     "huggingface": ("Hugging Face", "https://huggingface.co"),
     "hf-mirror": ("hf-mirror（Hugging Face 国内镜像）", "https://hf-mirror.com"),
 }
-NOT_FOR_VLLM = re.compile(r"(gguf|mlx|onnx|openvino|coreml|exl2|ggml)", re.IGNORECASE)
-# 搜索框空着时列的：常用、vLLM 支持得好的官方仓库
+# 排序：交给搜索接口排的（魔搭的 SortBy、HF 的 sort）；按大小排在本机做
+SORTS = {
+    "default": ("相关度", "Default", None),
+    "downloads": ("下载量", "DownloadsCount", "downloads"),
+    "updated": ("最近更新", "GmtModified", "lastModified"),
+    "stars": ("收藏数", "StarsCount", "likes"),
+}
+PAGE_SIZE = 100
+# 不是给 N 卡上的 vLLM / SGLang 用的：GGUF、MLX 这类格式，昇腾 NPU、手机芯片的转换版
+NOT_FOR_VLLM = re.compile(r"(gguf|mlx|onnx|openvino|coreml|exl2|ggml|npu|ascend|310p|910b|mindie|rknn|qnn)", re.IGNORECASE)
+# 量化方式：按仓库名认（顺序要紧：NVFP4 先于 FP8 之类）
+QUANTS = [
+    ("NVFP4", re.compile(r"nvfp4|(?<![a-z])fp4|mxfp4", re.IGNORECASE)),
+    ("FP8", re.compile(r"fp8|w8a8-fp8|fp8-dynamic", re.IGNORECASE)),
+    ("AWQ", re.compile(r"awq", re.IGNORECASE)),
+    ("GPTQ", re.compile(r"gptq", re.IGNORECASE)),
+    ("INT8", re.compile(r"w8a8|int8|8bit|8-bit", re.IGNORECASE)),
+    ("INT4", re.compile(r"w4a16|w4a8|int4|4bit|4-bit|bnb", re.IGNORECASE)),
+]
+QUANT_NAMES = ["原版"] + [name for name, _ in QUANTS]
+# 量化方式要的最低算力（compute capability）：NVFP4 是 Blackwell，FP8 是 Ada / Hopper 起
+QUANT_MIN_CAP = {"NVFP4": 10.0, "FP8": 8.9}
+# 搜索框空着时列的：常用、vLLM / SGLang 支持得好的官方仓库
 SUGGESTED = [
     "Qwen/Qwen3.6-35B-A3B-FP8",
     "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
@@ -27,13 +48,22 @@ SUGGESTED = [
 ]
 
 
+def quant_of(repo):
+    for name, pattern in QUANTS:
+        if pattern.search(repo):
+            return name
+    return "原版"
+
+
 class Model:
-    def __init__(self, repo, size=0, downloads=0, architectures=None, note=""):
+    def __init__(self, repo, size=0, downloads=0, architectures=None, updated=0, stars=0):
         self.repo = repo
         self.size = size
         self.downloads = downloads
         self.architectures = architectures or []
-        self.note = note
+        self.updated = updated      # 秒（Unix 时间）；不知道为 0
+        self.stars = stars
+        self.quant = quant_of(repo)
 
 
 def _get(url, method="GET", body=None, timeout=20):
@@ -44,31 +74,42 @@ def _get(url, method="GET", body=None, timeout=20):
         return json.loads(response.read().decode("utf-8"))
 
 
-def search(source, text, limit=40):
+def _hf_time(text):
+    """HF 的 lastModified（2026-10-12T08:00:00.000Z）→ 秒"""
+    import datetime
+    try:
+        return int(datetime.datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp())
+    except (TypeError, ValueError):
+        return 0
+
+
+def search(source, text, sort="default", limit=PAGE_SIZE):
     """[Model]；text 空着时给常用的那几个"""
     base = SOURCES[source][1]
     text = text.strip()
+    if not text:
+        return [info(source, repo) or Model(repo) for repo in SUGGESTED]
     if source == "modelscope":
-        body = {"PageSize": limit, "PageNumber": 1, "SortBy": "Default", "Target": "", "SingleCriterion": [], "Name": text}
-        if not text:
-            return [info(source, repo) or Model(repo) for repo in SUGGESTED]
+        body = {"PageSize": limit, "PageNumber": 1, "SortBy": SORTS[sort][1], "Target": "", "SingleCriterion": [], "Name": text}
         data = _get(base + "/api/v1/dolphin/models", method="PUT", body=body)
         models = []
         for item in (data.get("Data") or {}).get("Model", {}).get("Models") or []:
             repo = "%s/%s" % (item.get("Path"), item.get("Name"))
             if NOT_FOR_VLLM.search(repo):
                 continue
-            models.append(Model(repo, int(item.get("StorageSize") or 0), int(item.get("Downloads") or 0), item.get("Architectures") or []))
+            models.append(Model(repo, int(item.get("StorageSize") or 0), int(item.get("Downloads") or 0), item.get("Architectures") or [],
+                                int(item.get("LastUpdatedTime") or 0), int(item.get("Stars") or 0)))
         return models
-    if not text:
-        return [Model(repo) for repo in SUGGESTED]
-    query = urllib.parse.urlencode({"search": text, "limit": limit, "sort": "downloads", "direction": -1, "filter": "safetensors"})
-    data = _get(base + "/api/models?" + query)
-    return [Model(item["id"], 0, int(item.get("downloads") or 0)) for item in data if not NOT_FOR_VLLM.search(item["id"])]
+    params = {"search": text, "limit": limit, "filter": "safetensors", "full": "false"}
+    if SORTS[sort][2]:
+        params.update({"sort": SORTS[sort][2], "direction": -1})
+    data = _get(base + "/api/models?" + urllib.parse.urlencode(params))
+    return [Model(item["id"], 0, int(item.get("downloads") or 0), [], _hf_time(item.get("lastModified")), int(item.get("likes") or 0))
+            for item in data if not NOT_FOR_VLLM.search(item["id"])]
 
 
 def info(source, repo):
-    """一个仓库的大小、架构（只算会下载的文件）；查不到为 None"""
+    """一个仓库的大小、架构；查不到为 None"""
     base = SOURCES[source][1]
     try:
         if source == "modelscope":
@@ -76,11 +117,13 @@ def info(source, repo):
             item = data.get("Data") or {}
             if not item:
                 return None
-            return Model(repo, int(item.get("StorageSize") or 0), int(item.get("Downloads") or 0), item.get("Architectures") or [])
+            return Model(repo, int(item.get("StorageSize") or 0), int(item.get("Downloads") or 0), item.get("Architectures") or [],
+                         int(item.get("LastUpdatedTime") or 0), int(item.get("Stars") or 0))
         data = _get("%s/api/models/%s?blobs=true" % (base, repo))
         size = sum(int(s.get("size") or 0) for s in data.get("siblings") or [] if str(s.get("rfilename", "")).endswith(".safetensors"))
         config = data.get("config") or {}
-        return Model(repo, size, int(data.get("downloads") or 0), config.get("architectures") or [])
+        return Model(repo, size, int(data.get("downloads") or 0), config.get("architectures") or [], _hf_time(data.get("lastModified")),
+                     int(data.get("likes") or 0))
     except Exception:  # noqa: BLE001
         return None
 
