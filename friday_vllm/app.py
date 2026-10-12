@@ -1,4 +1,4 @@
-"""Friday vLLM 的主窗口：连上远程服务器 → 装 vLLM → 列出 / 下载模型 → 启动，给出 OpenAI 兼容地址（远程地址和本机隧道地址）。
+"""Friday vLLM 的主窗口：连上远程服务器 → 装 vLLM / SGLang → 列出 / 下载模型 → 启动，给出 OpenAI 兼容地址（远程地址和本机隧道地址）。
 
 Friday 本身不用改：把这里给的地址、密钥、模型名填进 Friday「设置 › 服务与密钥」的自定义服务（OpenAI 兼容）即可。
 """
@@ -28,9 +28,17 @@ except Exception:  # noqa: BLE001
 
 APP = "Friday vLLM"
 KEYRING_SERVICE = "Friday vLLM"
-TOOL_PARSERS = ["auto", "none", "hermes", "qwen3_coder", "qwen3_xml", "llama3_json", "mistral", "deepseek_v3", "deepseek_v31",
-                "glm45", "kimi_k2", "openai", "pythonic"]
-REASONING_PARSERS = ["auto", "none", "qwen3", "deepseek_r1", "glm45", "openai_gptoss", "mistral"]
+# 推理引擎：(名字, 缺省版本, 工具调用解析器, 思考解析器)；解析器的叫法两家不一样，照各自的文档
+ENGINES = {
+    "vllm": ("vLLM", "0.31.0",
+             ["auto", "none", "hermes", "qwen3_coder", "qwen3_xml", "llama3_json", "mistral", "deepseek_v3", "deepseek_v31", "glm45",
+              "kimi_k2", "openai", "pythonic"],
+             ["auto", "none", "qwen3", "deepseek_r1", "glm45", "openai_gptoss", "mistral"]),
+    "sglang": ("SGLang", "latest",
+               ["auto", "none", "qwen25", "qwen3_coder", "llama3", "mistral", "deepseekv3", "deepseekv31", "glm45", "kimi_k2", "gpt-oss",
+                "pythonic"],
+               ["auto", "none", "qwen3", "deepseek-r1", "glm45", "gpt-oss", "kimi"]),
+}
 
 
 def human(size):
@@ -77,7 +85,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._server_tab(), "服务器")
-        tabs.addTab(self._install_tab(), "安装 vLLM")
+        tabs.addTab(self._install_tab(), "安装引擎")
         tabs.addTab(self._models_tab(), "模型")
         tabs.addTab(self._serve_tab(), "运行")
         self.tabs = tabs
@@ -99,6 +107,7 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.setInterval(1500)
         self.timer.timeout.connect(self._poll)
+        self._engine_changed()
         self._load_profiles()
         self._set_connected(False)
 
@@ -341,24 +350,29 @@ class MainWindow(QMainWindow):
                 rows.append(("显卡", "%s，显存 %.1f GB（已用 %.1f GB），驱动 %s，算力 %s" % (
                     card["name"], card["memory_total_mib"] / 1024, card["memory_used_mib"] / 1024, card["driver"], card["compute_cap"])))
         else:
-            rows.append(("显卡", "<span style='color:#c33'>没找到 NVIDIA 显卡（vLLM 要 NVIDIA 显卡）</span>"))
+            rows.append(("显卡", "<span style='color:#c33'>没找到 NVIDIA 显卡（vLLM、SGLang 都要 NVIDIA 显卡；AutoDL 无卡模式下可以先装）</span>"))
         disk = p.get("disk") or {}
         if disk:
             rows.append(("磁盘", "%s 剩 %s / 共 %s" % (disk.get("path"), human(disk.get("free")), human(disk.get("total")))))
         rows.append(("Python", "%s（%s）" % (p.get("python"), p.get("python_version"))))
-        rows.append(("vLLM", p.get("vllm") or "没装（到「安装 vLLM」里装）"))
+        engines = p.get("engines") or {}
+        for engine, (title, *_rest) in ENGINES.items():
+            rows.append((title, engines.get(engine) or "没装（到「安装引擎」里装）"))
         serve = (p.get("jobs") or {}).get("serve") or {}
         if serve.get("status") == "running":
-            rows.append(("服务", "在跑：%s，端口 %s%s" % (serve.get("name"), serve.get("port"), "" if serve.get("healthy") else "（还在启动）")))
+            rows.append(("服务", "在跑：%s（%s），端口 %s%s" % (serve.get("name"), ENGINES.get(serve.get("engine") or "vllm", ("vLLM",))[0],
+                                                          serve.get("port"), "" if serve.get("healthy") else "，还在启动")))
         self.serverInfo.setText("<table cellspacing=6>" + "".join("<tr><td><b>%s</b></td><td>%s</td></tr>" % row for row in rows) + "</table>")
-        self.installedLabel.setText("已装：vLLM %s" % p["vllm"] if p.get("vllm") else "还没装 vLLM")
+        installed = ["%s %s" % (ENGINES[e][0], v) for e, v in engines.items() if v and e in ENGINES]
+        self.installedLabel.setText("已装：" + "、".join(installed) if installed else "还都没装")
+        self._engine_changed()
         warning = ""
         if cards:
             major = int(str(cards[0]["driver"]).split(".")[0] or 0)
             if major < 580:
-                warning = "显卡驱动 %s 低于 580：vLLM 0.2x 起默认用 CUDA 13，可能起不来；起不来就装旧一点的版本（比如 0.11.0）" % cards[0]["driver"]
+                warning = "显卡驱动 %s 低于 580：新版的 vLLM / SGLang 默认用 CUDA 13，可能起不来；起不来就装旧一点的版本" % cards[0]["driver"]
         else:
-            warning = "没找到 NVIDIA 显卡：vLLM 跑不了"
+            warning = "现在没检测到 NVIDIA 显卡（AutoDL 无卡模式？）：可以先装，运行时要带显卡开机"
         self.driverWarning.setText(warning)
         self.driverWarning.setVisible(bool(warning))
         self._apply_jobs(p.get("jobs") or {})
@@ -371,9 +385,15 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         self.installedLabel = QLabel()
         form.addRow("现在", self.installedLabel)
-        self.vllmVersion = QLineEdit("0.31.0")
-        self.vllmVersion.setPlaceholderText("版本号，或 latest")
-        form.addRow("vLLM 版本", self.vllmVersion)
+        self.installEngine = QComboBox()
+        for engine, (title, *_rest) in ENGINES.items():
+            self.installEngine.addItem(title, engine)
+        self.installEngine.currentIndexChanged.connect(
+            lambda: self.engineVersion.setText(ENGINES[self.installEngine.currentData()][1]))
+        form.addRow("引擎", self.installEngine)
+        self.engineVersion = QLineEdit(ENGINES["vllm"][1])
+        self.engineVersion.setPlaceholderText("版本号，或 latest")
+        form.addRow("版本", self.engineVersion)
         self.mirror = QComboBox()
         self.mirror.addItem("自动（测一下挑最快的）", "auto")
         for name, url in (("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"), ("中科大", "https://mirrors.ustc.edu.cn/pypi/simple"),
@@ -387,12 +407,13 @@ class MainWindow(QMainWindow):
         self.driverWarning.setWordWrap(True)
         self.driverWarning.setVisible(False)
         layout.addWidget(self.driverWarning)
-        note = QLabel("装在工作目录的 env/ 里（vLLM、torch 和 CUDA 库一共 8–10 GB），下载缓存放 uv-cache/。"
+        note = QLabel("vLLM 装在工作目录的 env/ 里，SGLang 装在 env-sglang/（两家要的 torch 版本不一样，分开装）；"
+                      "各自连同 torch 和 CUDA 库一共 8–10 GB，下载缓存放 uv-cache/。"
                       "安装在服务器上后台跑，关掉这个窗口、断线了也会装完。")
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QHBoxLayout()
-        self.installButton = QPushButton("安装 / 更新 vLLM")
+        self.installButton = QPushButton("安装 / 更新")
         self.installButton.clicked.connect(self._install)
         self.installStop = QPushButton("停止安装")
         self.installStop.clicked.connect(lambda: self._stop_job("install"))
@@ -407,11 +428,12 @@ class MainWindow(QMainWindow):
         return page
 
     def _install(self):
-        version = self.vllmVersion.text().strip() or "latest"
+        engine = self.installEngine.currentData()
+        version = self.engineVersion.text().strip() or "latest"
         self.offsets["install"] = 0
         self.watch = "install"
-        self.log("开始安装 vLLM %s" % version)
-        background(self.conn.agent, "install", "--version", version, "--index", self.mirror.currentData(),
+        self.log("开始安装 %s %s" % (ENGINES[engine][0], version))
+        background(self.conn.agent, "install", "--engine", engine, "--version", version, "--index", self.mirror.currentData(),
                    done=self._job_started("安装"), failed=self.fail("安装失败"))
 
     def _job_started(self, title):
@@ -468,7 +490,7 @@ class MainWindow(QMainWindow):
         searchRow.addWidget(searchButton)
         remoteLayout.addLayout(searchRow)
         self.resultTable = QTableWidget(0, 5)
-        self.resultTable.setHorizontalHeaderLabels(["仓库", "大小", "下载量", "架构", "vLLM 支持"])
+        self.resultTable.setHorizontalHeaderLabels(["仓库", "大小", "下载量", "架构", "装好的引擎支持吗"])
         self._table_style(self.resultTable)
         self.resultTable.itemSelectionChanged.connect(self._pick_result)
         remoteLayout.addWidget(self.resultTable)
@@ -552,18 +574,19 @@ class MainWindow(QMainWindow):
         background(catalog.search, source, text, done=self._show_results, failed=self.fail("搜索失败"))
 
     def _show_results(self, models):
-        archs = set(self.probe.get("archs") or [])
+        archs = {e: set(a or []) for e, a in (self.probe.get("archs") or {}).items() if a}
         self.results = models
         self.resultTable.setRowCount(len(models))
         for row, model in enumerate(models):
             supported = "—"
             if archs and model.architectures:
-                supported = "支持" if any(a in archs for a in model.architectures) else "不支持"
+                supported = "、".join("%s %s" % (ENGINES[e][0], "支持" if any(x in known for x in model.architectures) else "不支持")
+                                     for e, known in archs.items() if e in ENGINES)
             values = [model.repo, human(model.size), str(model.downloads or ""), "、".join(model.architectures), supported]
             for column, value in enumerate(values):
                 self.resultTable.setItem(row, column, QTableWidgetItem(value))
         if not models:
-            self.log("没搜到（GGUF、MLX 这类 vLLM 用不了的已经去掉了）")
+            self.log("没搜到（GGUF、MLX 这类 vLLM / SGLang 用不了的已经去掉了）")
 
     def _pick_result(self):
         rows = self.resultTable.selectionModel().selectedRows()
@@ -595,6 +618,11 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         form = QFormLayout()
+        self.serveEngine = QComboBox()
+        for engine, (title, *_rest) in ENGINES.items():
+            self.serveEngine.addItem(title, engine)
+        self.serveEngine.currentIndexChanged.connect(self._engine_changed)
+        form.addRow("引擎", self.serveEngine)
         self.serveModel = QComboBox()
         self.serveModel.currentIndexChanged.connect(self._model_changed)
         form.addRow("模型", self.serveModel)
@@ -639,11 +667,7 @@ class MainWindow(QMainWindow):
         tuning.addStretch(1)
         form.addRow("调优", tuning)
         self.toolParser = QComboBox()
-        for name in TOOL_PARSERS:
-            self.toolParser.addItem({"auto": "自动（按模型家族）", "none": "不开工具调用"}.get(name, name), name)
         self.reasoningParser = QComboBox()
-        for name in REASONING_PARSERS:
-            self.reasoningParser.addItem({"auto": "自动（按模型家族）", "none": "不解析"}.get(name, name), name)
         parserRow = QHBoxLayout()
         parserRow.addWidget(QLabel("工具调用"))
         parserRow.addWidget(self.toolParser, 1)
@@ -651,7 +675,7 @@ class MainWindow(QMainWindow):
         parserRow.addWidget(self.reasoningParser, 1)
         form.addRow("解析", parserRow)
         self.extraArgs = QLineEdit(self.settings.value("extraArgs", ""))
-        self.extraArgs.setPlaceholderText("其他 vllm serve 参数，例如 --enforce-eager（启动快、跑得慢）")
+        self.extraArgs.setPlaceholderText("其他启动参数，例如 vLLM 的 --enforce-eager（启动快、跑得慢）、SGLang 的 --tp 2")
         form.addRow("其他参数", self.extraArgs)
         layout.addLayout(form)
         buttons = QHBoxLayout()
@@ -702,12 +726,25 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.keyText, 5, 1)
         grid.addWidget(copy_button(self.keyText.text), 5, 2)
         friday = QLabel("在 Friday 里用：设置 › 服务与密钥 › 添加服务 › 自定义（OpenAI 兼容），地址、密钥、模型名照上面填；"
-                        "起步并发可以调到 16 以上（vLLM 并发越多越快）。隧道要这个窗口开着才通。")
+                        "起步并发可以调到 16 以上（vLLM、SGLang 并发越多越快）。隧道要这个窗口开着才通。")
         friday.setWordWrap(True)
         grid.addWidget(friday, 6, 0, 1, 3)
         layout.addWidget(box)
         layout.addStretch(1)
         return page
+
+    def _engine_changed(self, *_):
+        """换引擎：解析器的选项换成那家的叫法；没装的不能启动"""
+        engine = self.serveEngine.currentData() or "vllm"
+        title, _version, tools, reasonings = ENGINES[engine]
+        for combo, names, off in ((self.toolParser, tools, "不开工具调用"), (self.reasoningParser, reasonings, "不解析")):
+            combo.clear()
+            for name in names:
+                combo.addItem({"auto": "自动（按模型家族）", "none": off}.get(name, name), name)
+        running = (self.jobs.get("serve") or {}).get("status") == "running"
+        installed = bool((self.probe.get("engines") or {}).get(engine))
+        self.startButton.setEnabled(bool(self.conn) and not running and installed)
+        self.startButton.setToolTip("" if installed else "还没装 %s（到「安装引擎」里装）" % title)
 
     def _model_changed(self, *_):
         path = self.serveModel.currentData() or ""
@@ -723,7 +760,8 @@ class MainWindow(QMainWindow):
         for key, value in (("servePort", self.servePort.value()), ("apiKey", self.apiKey.text()), ("gpuUtil", self.gpuUtil.value()),
                            ("maxSeqs", self.maxSeqs.value()), ("extraArgs", self.extraArgs.text()), ("localPort", self.localPort.value())):
             self.settings.setValue(key, value)
-        args = ["serve", "--model", path, "--name", name, "--host", self.serveHost.currentData(), "--port", self.servePort.value(),
+        engine = self.serveEngine.currentData()
+        args = ["serve", "--engine", engine, "--model", path, "--name", name, "--host", self.serveHost.currentData(), "--port", self.servePort.value(),
                 "--gpu-util", "%.2f" % self.gpuUtil.value(), "--max-len", self.maxLen.value(), "--max-seqs", self.maxSeqs.value(),
                 "--tool-parser", self.toolParser.currentData(), "--reasoning-parser", self.reasoningParser.currentData(),
                 "--extra", self.extraArgs.text().strip()]
@@ -731,7 +769,7 @@ class MainWindow(QMainWindow):
             args += ["--key", self.apiKey.text().strip()]
         self.offsets["serve"] = 0
         self.watch = "serve"
-        self.log("启动 vLLM：%s（端口 %d）" % (path, self.servePort.value()))
+        self.log("启动 %s：%s（端口 %d）" % (ENGINES[engine][0], path, self.servePort.value()))
 
         def done(result):
             if not result.get("ok"):
@@ -881,7 +919,7 @@ class MainWindow(QMainWindow):
             self.serveStatus.setText({"failed": "没起来，看下面的日志", "stopped": "已停止"}.get(serve.get("status"), "没在跑"))
             if self.conn and self.conn.tunnel_open(self.localPort.value()) and (before.get("serve") or {}).get("status") == "running":
                 self.conn.close_tunnel(self.localPort.value())
-        self.startButton.setEnabled(not running and bool(self.probe.get("vllm")))
+        self.startButton.setEnabled(not running and bool((self.probe.get("engines") or {}).get(self.serveEngine.currentData())))
         self.stopButton.setEnabled(running)
         self._update_addresses()
         # 没在看日志时，跟着在跑的任务看

@@ -2,16 +2,18 @@
 """Friday vLLM 的服务器端助手：图形界面经 SSH 上传到 <工作目录>/agent.py，用服务器上的 Python（3.8 起，只用标准库）运行。
 
     agent.py probe   --base D                          机器信息（显卡、驱动、磁盘、Python、装没装 vLLM、服务在不在跑），JSON
-    agent.py install --base D [--version V] [--index URL|auto]     后台任务：建虚拟环境、装 uv、装 vLLM
+    agent.py install --base D [--engine vllm|sglang] [--version V] [--index URL|auto]
+                                                       后台任务：建虚拟环境、装 uv、装 vLLM / SGLang
     agent.py download --base D --repo ORG/NAME --source modelscope|huggingface|hf-mirror --dir 目标目录
                                                        后台任务：多连接分段下载、断点续传、按 sha256 校验
     agent.py models  --dirs 目录1,目录2                   列出已下好的模型（有 config.json 和 *.safetensors 的目录），JSON
-    agent.py serve   --base D --model 目录 ...           后台起 vllm serve，记下 pid / 端口 / 密钥
+    agent.py serve   --base D [--engine vllm|sglang] --model 目录 ...   后台起服务，记下 pid / 端口 / 密钥
     agent.py stop    --base D [--job serve|install|download]   停掉
     agent.py status  --base D                          各任务的状态 + 服务健康检查，JSON
     agent.py tail    --base D --job J --offset N         从第 N 个字节起读任务日志，JSON
 
-工作目录 D 的布局：env/（vLLM 的虚拟环境）、uv-cache/、models/（缺省下载位置）、logs/<任务>.log、state/<任务>.json。
+工作目录 D 的布局：env/（vLLM 的虚拟环境）、env-sglang/（SGLang 的）、uv-cache/、models/（缺省下载位置）、
+logs/<任务>.log、state/<任务>.json。
 后台任务用 setsid 脱离 SSH 会话：界面关了、断线了照样跑完，重连后接着看。
 """
 import argparse
@@ -33,6 +35,17 @@ import urllib.request
 
 VERSION = "0.1.0"
 DEFAULT_VLLM = "0.31.0"
+# 推理引擎：各装在自己的虚拟环境里（依赖的 torch 版本不一样，装一起会互相顶掉）；vLLM 照旧在 env/
+ENGINES = {
+    "vllm": {
+        "title": "vLLM", "env": "env", "package": "vllm", "spec": "vllm", "default": DEFAULT_VLLM,
+        "archs": "import json; from vllm import ModelRegistry; print(json.dumps(sorted(ModelRegistry.get_supported_archs())))",
+    },
+    "sglang": {
+        "title": "SGLang", "env": "env-sglang", "package": "sglang", "spec": "sglang[all]", "default": "latest",
+        "archs": "import json; from sglang.srt.models.registry import ModelRegistry; print(json.dumps(sorted(ModelRegistry.get_supported_archs())))",
+    },
+}
 # pip 镜像（自动挑最快的）；国内机器上 PyPI 官方往往最慢
 MIRRORS = [
     ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"),
@@ -150,13 +163,25 @@ def gpus():
     return result
 
 
-def vllm_version(env):
-    python = os.path.join(env, "bin", "python")
-    if not os.path.exists(os.path.join(env, "bin", "vllm")):
+def engine_env(base, engine):
+    return os.path.join(base, ENGINES[engine]["env"])
+
+
+def engine_version(base, engine):
+    """装好的版本（没装为空）；只读包的元数据（import 要好几秒）"""
+    python = os.path.join(engine_env(base, engine), "bin", "python")
+    if not os.path.exists(python):
         return ""
-    # 只读包的元数据（import vllm 要好几秒）
-    code, out, _ = run([python, "-c", "import importlib.metadata as m; print(m.version('vllm'))"], timeout=20)
+    code, out, _ = run([python, "-c", "import importlib.metadata as m; print(m.version(%r))" % ENGINES[engine]["package"]], timeout=20)
     return out if code == 0 else ""
+
+
+def engine_archs(base, engine):
+    state = paths(base)["state"]
+    found = read_json(os.path.join(state, "archs-%s.json" % engine))
+    if found is None and engine == "vllm":
+        found = read_json(os.path.join(state, "archs.json"))   # 0.1.0 写的
+    return found or []
 
 
 def cmd_probe(args):
@@ -174,8 +199,8 @@ def cmd_probe(args):
         "gpus": gpus(),
         "disk": disk_free(args.base),
         "base": args.base,
-        "vllm": vllm_version(p["env"]),
-        "archs": read_json(os.path.join(p["state"], "archs.json"), []),
+        "engines": {engine: engine_version(args.base, engine) for engine in ENGINES},
+        "archs": {engine: engine_archs(args.base, engine) for engine in ENGINES},
         "jobs": jobs_status(args.base),
     }
     emit(info)
@@ -296,16 +321,27 @@ def cmd_stop(args):
 # ── install ──
 
 def fastest_mirror():
-    """每个镜像取一下 /simple/vllm/ 的页面，挑最快的"""
+    """每个镜像真下一个文件（pip 的轮子，约 2 MB）比速度：只看索引页打开得快不准（阿里云索引页最快、大文件却只有 0.5 MB/s）"""
     best = None
     for name, url in MIRRORS:
-        started = time.time()
         try:
-            with urllib.request.urlopen(url.rstrip("/") + "/vllm/", timeout=8) as response:
-                body = response.read()
-            elapsed = time.time() - started
-            speed = len(body) / max(elapsed, 0.001)
-            log("镜像 %s：%.1f 秒（%s/s）" % (name, elapsed, human(speed)))
+            page_url = url.rstrip("/") + "/pip/"
+            with urllib.request.urlopen(page_url, timeout=8) as response:
+                page = response.read().decode("utf-8", "replace")
+            wheels = re.findall(r'href="([^"]+?\.whl)[^"]*"', page)
+            if not wheels:
+                raise RuntimeError("索引页里没有轮子")
+            wheel = urllib.parse.urljoin(page_url, wheels[-1])
+            started = time.time()
+            size = 0
+            with urllib.request.urlopen(wheel, timeout=10) as response:
+                while time.time() - started < 8:
+                    block = response.read(256 << 10)
+                    if not block:
+                        break
+                    size += len(block)
+            speed = size / max(time.time() - started, 0.001)
+            log("镜像 %s：%s/s" % (name, human(speed)))
             if best is None or speed > best[2]:
                 best = (name, url, speed)
         except Exception as error:  # noqa: BLE001
@@ -331,16 +367,20 @@ def find_python():
 
 def cmd_install(args):
     if not args.foreground:
-        argv = ["install", "--base", args.base, "--version", args.version, "--index", args.index]
+        argv = ["install", "--base", args.base, "--engine", args.engine, "--version", args.version, "--index", args.index]
         return start_job(args.base, "install", argv)
     p = paths(args.base)
+    engine = ENGINES[args.engine]
+    env = engine_env(args.base, args.engine)
+    title = engine["title"]
     try:
+        log("装 %s" % title)
         cards = gpus()
         if cards:
             driver = cards[0]["driver"]
             log("显卡：%s，驱动 %s" % (cards[0]["name"], driver))
             if int(driver.split(".")[0]) < 580:
-                log("注意：驱动 %s 低于 580，vLLM 0.2x 起默认的 CUDA 13 版可能起不来；起不来就换旧一点的 vLLM 版本" % driver)
+                log("注意：驱动 %s 低于 580，默认的 CUDA 13 版可能起不来；起不来就换旧一点的版本" % driver)
         else:
             # 装不需要显卡（AutoDL 的无卡模式开机装更省钱），运行时才要
             log("注意：现在没检测到 NVIDIA 显卡（AutoDL 无卡模式？）。可以先装，运行时要带显卡开机")
@@ -355,12 +395,12 @@ def cmd_install(args):
                 raise RuntimeError("所有 pip 镜像都连不上，检查服务器的网络")
             log("用镜像：%s（%s）" % (best[0], best[1]))
             index = best[1]
-        if not os.path.exists(os.path.join(p["env"], "bin", "python")):
-            log("建虚拟环境：%s" % p["env"])
-            code, out, err = run([python, "-m", "venv", p["env"]], timeout=300)
+        if not os.path.exists(os.path.join(env, "bin", "python")):
+            log("建虚拟环境：%s" % env)
+            code, out, err = run([python, "-m", "venv", env], timeout=300)
             if code != 0:
                 raise RuntimeError("建虚拟环境失败：%s" % (err or out))
-        env_python = os.path.join(p["env"], "bin", "python")
+        env_python = os.path.join(env, "bin", "python")
         log("装 uv（并行下载、自动重试）")
         code = subprocess.call([env_python, "-m", "pip", "install", "-q", "-i", index, "--upgrade", "uv"])
         if code != 0:
@@ -369,29 +409,29 @@ def cmd_install(args):
         # uv 的缓存放在工作目录里（同一个盘上用硬链接，不多占一份；系统盘常常很小）
         environment.update({"UV_CACHE_DIR": p["cache"], "UV_LINK_MODE": "hardlink", "UV_HTTP_TIMEOUT": "180",
                             "UV_CONCURRENT_DOWNLOADS": "16", "UV_HTTP_RETRIES": "10"})
-        spec = "vllm" if args.version in ("", "latest") else "vllm==" + args.version
+        version = args.version or engine["default"]
+        spec = engine["spec"] if version == "latest" else "%s==%s" % (engine["spec"], version)
         log("装 %s（torch 和 CUDA 库一共好几 GB，要一会儿）" % spec)
         tried = [index] + [url for _, url in MIRRORS if url != index]
         ok = False
         for attempt in tried[:3]:
             log("从 %s 装" % attempt)
-            code = subprocess.call([os.path.join(p["env"], "bin", "uv"), "pip", "install", "--python", env_python, "--index-url", attempt, spec],
+            code = subprocess.call([os.path.join(env, "bin", "uv"), "pip", "install", "--python", env_python, "--index-url", attempt, spec],
                                    env=environment)
             if code == 0:
                 ok = True
                 break
             log("这个镜像没装成，换下一个")
         if not ok:
-            raise RuntimeError("vLLM 没装成，看上面的日志")
-        installed = vllm_version(p["env"])
-        log("vLLM %s 装好了；读它支持的模型架构" % installed)
-        code, out, err = run([env_python, "-c", "import json; from vllm import ModelRegistry; print(json.dumps(sorted(ModelRegistry.get_supported_archs())))"],
-                             timeout=600)
-        if code == 0 and out:
-            write_json(os.path.join(p["state"], "archs.json"), json.loads(out.splitlines()[-1]))
-        else:
-            log("读支持的架构失败（不影响使用）：%s" % err[-300:])
-        finish_job(args.base, "install", True, "vLLM %s 装好了" % installed, vllm=installed)
+            raise RuntimeError("%s 没装成，看上面的日志" % title)
+        installed = engine_version(args.base, args.engine)
+        log("%s %s 装好了；读它支持的模型架构" % (title, installed))
+        code, out, err = run([env_python, "-c", engine["archs"]], timeout=600)
+        try:
+            write_json(os.path.join(p["state"], "archs-%s.json" % args.engine), json.loads(out.splitlines()[-1]))
+        except (ValueError, IndexError):
+            log("读支持的架构失败（不影响使用）：%s" % (err or out)[-300:])
+        finish_job(args.base, "install", True, "%s %s 装好了" % (title, installed), engine=args.engine, version=installed)
         log("完成")
     except Exception as error:  # noqa: BLE001
         log("失败：%s" % error)
@@ -686,8 +726,18 @@ def cmd_models(args):
 
 # ── serve ──
 
-def parsers_for(model_dir):
-    """按模型家族给 vLLM 的工具调用、思考解析器（vLLM 的 recipes）；认不出来的不开工具调用"""
+def parsers_for(model_dir, engine="vllm"):
+    """按模型家族给工具调用、思考解析器（vLLM / SGLang 各自的叫法，照它们的文档）；认不出来的不开工具调用"""
+    tool, reasoning = vllm_parsers(model_dir)
+    if engine == "sglang":
+        tool = {"hermes": "qwen25", "deepseek_v3": "deepseekv3", "openai": "gpt-oss", "llama3_json": "llama3"}.get(tool, tool)
+        reasoning = {"deepseek_r1": "deepseek-r1", "openai_gptoss": "gpt-oss"}.get(reasoning, reasoning)
+        if tool == "kimi_k2" and not reasoning:
+            reasoning = "kimi"
+    return tool, reasoning
+
+
+def vllm_parsers(model_dir):
     config = read_json(os.path.join(model_dir, "config.json"), {})
     kind = (config.get("model_type") or (config.get("text_config") or {}).get("model_type") or "").lower()
     name = os.path.basename(model_dir.rstrip("/")).lower()
@@ -714,34 +764,45 @@ def parsers_for(model_dir):
 
 def cmd_serve(args):
     p = paths(args.base)
-    vllm = os.path.join(p["env"], "bin", "vllm")
-    if not os.path.exists(vllm):
-        emit({"ok": False, "error": "还没装 vLLM"})
+    engine = ENGINES[args.engine]
+    python = os.path.join(engine_env(args.base, args.engine), "bin", "python")
+    if not engine_version(args.base, args.engine):
+        emit({"ok": False, "error": "还没装 %s" % engine["title"]})
         return
     state = read_json(os.path.join(p["state"], "serve.json"), {})
     if state.get("status") == "running" and alive(state.get("pid")):
         emit({"ok": False, "error": "服务已经在跑（pid %s，端口 %s），先停掉" % (state.get("pid"), state.get("port"))})
         return
     if not gpus():
-        emit({"ok": False, "error": "没检测到 NVIDIA 显卡（nvidia-smi 不能用）：vLLM 要显卡才能跑。AutoDL 上要用「有卡模式」开机"})
+        emit({"ok": False, "error": "没检测到 NVIDIA 显卡（nvidia-smi 不能用）：%s 要显卡才能跑。AutoDL 上要用「有卡模式」开机" % engine["title"]})
         return
     model = os.path.abspath(os.path.expanduser(args.model))
     if not os.path.exists(os.path.join(model, "config.json")):
         emit({"ok": False, "error": "%s 不是模型目录（没有 config.json）" % model})
         return
-    tool, reasoning = parsers_for(model)
+    tool, reasoning = parsers_for(model, args.engine)
     if args.tool_parser != "auto":
         tool = args.tool_parser if args.tool_parser != "none" else ""
     if args.reasoning_parser != "auto":
         reasoning = args.reasoning_parser if args.reasoning_parser != "none" else ""
-    cmd = [vllm, "serve", model, "--served-model-name", args.name, "--host", args.host, "--port", str(args.port),
-           "--gpu-memory-utilization", str(args.gpu_util), "--max-num-seqs", str(args.max_seqs), "--enable-prefix-caching"]
+    if args.engine == "sglang":
+        # SGLang：RadixAttention 前缀缓存默认开着；显存占比是给权重 + KV 的静态部分
+        cmd = [python, "-m", "sglang.launch_server", "--model-path", model, "--served-model-name", args.name, "--host", args.host,
+               "--port", str(args.port), "--mem-fraction-static", str(args.gpu_util), "--max-running-requests", str(args.max_seqs)]
+        if args.max_len:
+            cmd += ["--context-length", str(args.max_len)]
+        if tool:
+            cmd += ["--tool-call-parser", tool]
+    else:
+        cmd = [os.path.join(engine_env(args.base, args.engine), "bin", "vllm"), "serve", model, "--served-model-name", args.name,
+               "--host", args.host, "--port", str(args.port), "--gpu-memory-utilization", str(args.gpu_util),
+               "--max-num-seqs", str(args.max_seqs), "--enable-prefix-caching"]
+        if args.max_len:
+            cmd += ["--max-model-len", str(args.max_len)]
+        if tool:
+            cmd += ["--enable-auto-tool-choice", "--tool-call-parser", tool]
     if args.key:
         cmd += ["--api-key", args.key]
-    if args.max_len:
-        cmd += ["--max-model-len", str(args.max_len)]
-    if tool:
-        cmd += ["--enable-auto-tool-choice", "--tool-call-parser", tool]
     if reasoning:
         cmd += ["--reasoning-parser", reasoning]
     if args.extra:
@@ -758,6 +819,7 @@ def cmd_serve(args):
                                  cwd=args.base, env=environment)
     write_json(os.path.join(p["state"], "serve.json"),
                {"status": "running", "pid": child.pid, "started": time.time(), "log": log_path, "port": args.port, "host": args.host,
+                "engine": args.engine,
                 "key": args.key, "name": args.name, "model": model, "tool_parser": tool, "reasoning_parser": reasoning})
     emit({"ok": True, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning})
 
@@ -778,7 +840,8 @@ def main():
     add("probe", cmd_probe)
     add("status", cmd_status)
     command = add("install", cmd_install)
-    command.add_argument("--version", default=DEFAULT_VLLM)
+    command.add_argument("--engine", default="vllm", choices=sorted(ENGINES))
+    command.add_argument("--version", default="", help="版本号或 latest；不给用各引擎的缺省")
     command.add_argument("--index", default="auto")
     command = add("download", cmd_download)
     command.add_argument("--repo", required=True)
@@ -789,6 +852,7 @@ def main():
     command = add("models", cmd_models)
     command.add_argument("--dirs", default="")
     command = add("serve", cmd_serve)
+    command.add_argument("--engine", default="vllm", choices=sorted(ENGINES))
     command.add_argument("--model", required=True)
     command.add_argument("--name", required=True)
     command.add_argument("--host", default="0.0.0.0")
