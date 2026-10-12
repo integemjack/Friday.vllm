@@ -773,6 +773,8 @@ class MainWindow(QMainWindow):
         self.gpuUtil.setRange(0.3, 0.98)
         self.gpuUtil.setSingleStep(0.05)
         self.gpuUtil.setValue(float(self.settings.value("gpuUtil", 0.9)))
+        self.gpuUtil.setToolTip("权重 + KV 缓存最多占每张卡显存的多少。别调到 0.95 以上：CUDA graph、现场编译的内核也要显存，"
+                                "SGLang 在 0.98 时只剩 1 GB 多，起不来")
         self.maxLen = QSpinBox()
         self.maxLen.setRange(0, 4_000_000)
         self.maxLen.setSingleStep(8192)

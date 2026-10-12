@@ -203,6 +203,66 @@ def gpus():
     return result
 
 
+def bundled_cuda(env):
+    """引擎环境里 pip 装进来的 CUDA 工具链（nvidia/cu13/bin/nvcc 这类），有好几个时取版本最新的；没有为空。
+    SGLang 的 DeepGEMM、FlashInfer 启动时要现场编译内核，没设 CUDA_HOME 就用系统的 /usr/local/cuda——
+    AutoDL 镜像里是 12.8，Blackwell（算力 12.x）要 12.9 起，报 NVCC version must be at least 12.9"""
+    import glob
+    found = []
+    for nvcc in glob.glob(os.path.join(env, "lib", "python3*", "site-packages", "nvidia", "*", "bin", "nvcc")):
+        home = os.path.dirname(os.path.dirname(nvcc))
+        code, out, _ = run([nvcc, "--version"], timeout=20)
+        match = re.search(r"release (\d+)\.(\d+)", out)
+        if code == 0 and match:
+            found.append(((int(match.group(1)), int(match.group(2))), home))
+    return max(found)[1] if found else ""
+
+
+def link_bundled_cuda(home):
+    """pip 装的 CUDA 工具链少两样现场编译要的东西：lib64（FlashInfer 用 -L$CUDA_HOME/lib64）、不带版本号的 libcudart.so（-lcudart）"""
+    try:
+        if not os.path.exists(os.path.join(home, "lib64")) and os.path.isdir(os.path.join(home, "lib")):
+            os.symlink("lib", os.path.join(home, "lib64"))
+        lib = os.path.join(home, "lib")
+        if os.path.isdir(lib) and not os.path.exists(os.path.join(lib, "libcudart.so")):
+            versioned = sorted(n for n in os.listdir(lib) if re.match(r"libcudart\.so\.\d+$", n))
+            if versioned:
+                os.symlink(versioned[-1], os.path.join(lib, "libcudart.so"))
+    except OSError as error:
+        log("补 CUDA 工具链的链接失败（不一定影响）：%s" % error)
+
+
+# 现场编译内核用的工具链包：版本要和 torch 用的 CUDA 运行库同一个小版本（CCCL 要求编译器和 CUDA 头文件版本一致，
+# nvvm 新了生成的 PTX 老 ptxas 不认）。有的包只要求「不低于」，uv 会装成最新的，装完要对齐
+TOOLCHAIN = {
+    "nvidia-cuda-runtime": ["nvidia-cuda-nvcc", "nvidia-cuda-crt", "nvidia-nvvm"],
+    "nvidia-cuda-runtime-cu12": ["nvidia-cuda-nvcc-cu12"],
+}
+
+
+def align_toolchain(env, index, environment):
+    python = os.path.join(env, "bin", "python")
+    code, out, _ = run([python, "-c", "import importlib.metadata as m, json; print(json.dumps({d.metadata['Name'].lower(): d.version "
+                                      "for d in m.distributions() if d.metadata['Name'].lower().startswith('nvidia-')}))"], timeout=60)
+    if code != 0:
+        return
+    installed = json.loads(out.splitlines()[-1])
+    wanted = []
+    for runtime, tools in TOOLCHAIN.items():
+        if runtime not in installed:
+            continue
+        target = ".".join(installed[runtime].split(".")[:2])
+        for tool in tools:
+            if tool in installed and ".".join(installed[tool].split(".")[:2]) != target:
+                wanted.append("%s==%s.*" % (tool, target))
+    if not wanted:
+        return
+    log("CUDA 编译工具链对齐到运行库的版本：%s" % "、".join(wanted))
+    code = subprocess.call([os.path.join(env, "bin", "uv"), "pip", "install", "--python", python, "--index-url", index] + wanted, env=environment)
+    if code != 0:
+        log("对齐没成（现场编译内核时可能报 CUDA 版本不一致）")
+
+
 def attention_heads(model_dir):
     """模型的注意力头数（张量并行的份数要能整除它）；读不到为 0"""
     config = read_json(os.path.join(model_dir, "config.json"), {})
@@ -549,6 +609,7 @@ def cmd_install(args):
             log("这个镜像没装成，换下一个")
         if not ok:
             raise RuntimeError("%s 没装成，看上面的日志" % title)
+        align_toolchain(env, attempt, environment)
         installed = engine_version(args.base, args.engine)
         log("%s %s 装好了；读它支持的模型架构" % (title, installed))
         code, out, err = run([env_python, "-c", engine["archs"]], timeout=600)
@@ -978,9 +1039,19 @@ def cmd_serve(args):
     # torch.compile 的缓存放工作目录里：第二次启动快很多
     environment.setdefault("VLLM_CACHE_ROOT", os.path.join(args.base, "vllm-cache"))
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    # 引擎环境的 bin（ninja 这类现场编译内核要用的工具在这）和它自带的 CUDA 工具链放在 PATH 最前面
+    environment["PATH"] = os.path.join(engine_env(args.base, args.engine), "bin") + os.pathsep + environment.get("PATH", "")
+    environment["VIRTUAL_ENV"] = engine_env(args.base, args.engine)
+    cuda = bundled_cuda(engine_env(args.base, args.engine))
+    if cuda:
+        link_bundled_cuda(cuda)
+        environment["CUDA_HOME"] = environment["CUDA_PATH"] = cuda
+        environment["PATH"] = os.path.join(cuda, "bin") + os.pathsep + environment["PATH"]
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in chosen[:tp * dp])
     with open(log_path, "w") as out:
         out.write("$ " + " ".join(c if args.key is None or c != args.key else "***" for c in cmd) + "\n")
+        if cuda:
+            out.write("CUDA_HOME=%s（引擎环境自带的 CUDA 工具链）\n" % cuda)
         out.flush()
         child = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                                  cwd=args.base, env=environment)
