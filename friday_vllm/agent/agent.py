@@ -919,6 +919,43 @@ def cmd_models(args):
     emit({"models": found})
 
 
+def cmd_delete_model(args):
+    """删掉服务器上的一个模型目录：只删列模型的那些目录里面的、看得出是模型的；在跑的服务用着、正在下的不删"""
+    target = os.path.realpath(args.path)
+    roots = [os.path.realpath(os.path.expanduser(d)) for d in (args.dirs or "").split(",") if d]
+    root = next((r for r in roots if target.startswith(r.rstrip(os.sep) + os.sep)), None)
+    if not root:
+        emit({"ok": False, "error": "%s 不在列模型的目录里，不删" % target})
+        return
+    if not os.path.isdir(target):
+        emit({"ok": False, "error": "%s 已经不在了" % target})
+        return
+    names = os.listdir(target)
+    if not ("config.json" in names or ".friday-vllm.json" in names or any(n.endswith((".safetensors", ".safetensors.part")) for n in names)):
+        emit({"ok": False, "error": "%s 看着不像模型目录（没有 config.json、safetensors），不删" % target})
+        return
+    for service in services_status(args.base).values():
+        model = os.path.realpath(service.get("model") or "")
+        if service.get("status") == "running" and (model == target or model.startswith(target + os.sep)):
+            emit({"ok": False, "error": "服务 %s 正用着这个模型：先停掉它" % service["id"]})
+            return
+    download = jobs_status(args.base).get("download") or {}
+    if download.get("status") == "running" and os.path.realpath(download.get("dir") or "") == target:
+        emit({"ok": False, "error": "这个模型正在下：先取消下载"})
+        return
+    size = describe_model(target)["size"]
+    shutil.rmtree(target)
+    # 空下来的上层目录（models/<组织>/）一起删，删到列模型的那个目录为止
+    parent = os.path.dirname(target)
+    while parent.startswith(root.rstrip(os.sep) + os.sep):
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+    emit({"ok": True, "freed": size, "message": "删掉了 %s，空出 %s" % (target, human(size))})
+
+
 # ── serve ──
 
 def parsers_for(model_dir, engine="vllm"):
@@ -1125,6 +1162,9 @@ def main():
     command.add_argument("--include", action="append")
     command = add("models", cmd_models)
     command.add_argument("--dirs", default="")
+    command = add("delete-model", cmd_delete_model)
+    command.add_argument("--path", required=True)
+    command.add_argument("--dirs", required=True, help="列模型的目录（逗号分开）：只删这些目录里面的")
     command = add("serve", cmd_serve)
     command.add_argument("--engine", default="vllm", choices=sorted(ENGINES))
     command.add_argument("--model", required=True)
@@ -1154,7 +1194,7 @@ def main():
     args = parser.parse_args()
     # 后台任务的工作目录是 base：相对路径都先转成绝对的
     args.base = os.path.abspath(os.path.expanduser(args.base))
-    for name in ("dir", "model"):
+    for name in ("dir", "model", "path"):
         if getattr(args, name, None):
             setattr(args, name, os.path.abspath(os.path.expanduser(getattr(args, name))))
     os.makedirs(args.base, exist_ok=True)

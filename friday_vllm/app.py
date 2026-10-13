@@ -478,10 +478,21 @@ class MainWindow(QMainWindow):
         self.modelTable.setHorizontalHeaderLabels(["模型", "大小", "架构", "量化", "状态", "目录"])
         self._table_style(self.modelTable)
         self.modelTable.cellDoubleClicked.connect(self._use_model_row)
+        self.modelTable.itemSelectionChanged.connect(self._model_selection_changed)
         localLayout.addWidget(self.modelTable)
-        hint = QLabel("双击一行：在「运行」里用它")
+        modelButtons = QHBoxLayout()
+        self.useModelButton = QPushButton("用它新建服务")
+        self.useModelButton.clicked.connect(lambda: self._use_model_row(self.modelTable.currentRow(), 0))
+        self.deleteModelButton = QPushButton("删除…")
+        self.deleteModelButton.setToolTip("从服务器上删掉选中的模型目录（在跑的服务用着、正在下的不能删）")
+        self.deleteModelButton.clicked.connect(self._delete_model)
+        modelButtons.addWidget(self.useModelButton)
+        modelButtons.addWidget(self.deleteModelButton)
+        hint = QLabel("双击一行：在「新建服务」里用它")
         hint.setStyleSheet("color: gray")
-        localLayout.addWidget(hint)
+        modelButtons.addWidget(hint, 1)
+        localLayout.addLayout(modelButtons)
+        self._model_selection_changed()
         layout.addWidget(local, 2)
 
         remote = QGroupBox("下载模型（下到服务器上）")
@@ -613,8 +624,46 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.serveModel.setCurrentIndex(index)
         self._model_changed()
+        self._model_selection_changed()
+
+    def _selected_local_model(self):
+        rows = self.modelTable.selectionModel().selectedRows()
+        return self.models[rows[0].row()] if rows and rows[0].row() < len(self.models) else None
+
+    def _model_selection_changed(self):
+        model = self._selected_local_model()
+        self.useModelButton.setEnabled(bool(model and model["complete"]))
+        self.deleteModelButton.setEnabled(bool(model))
+
+    def _delete_model(self):
+        model = self._selected_local_model()
+        if not model or not self.conn:
+            return
+        users = [sv.get("name") or sid for sid, sv in self.services.items()
+                 if sv.get("status") == "running" and (sv.get("model") or "").rstrip("/") == model["path"].rstrip("/")]
+        if users:
+            QMessageBox.information(self, APP, "服务 %s 正用着这个模型：先在「服务」里停掉" % "、".join(users))
+            return
+        answer = QMessageBox.question(self, "删除模型", "从服务器上删掉这个模型？\n\n%s（%s）\n%s\n\n删了要用得重新下。" % (
+            model["name"], human(model["size"]), model["path"]), QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes:
+            return
+        self.deleteModelButton.setEnabled(False)
+        self.log("删除模型 %s" % model["path"])
+
+        def done(result):
+            if not result.get("ok"):
+                QMessageBox.warning(self, "删除失败", result.get("error") or "没删掉")
+            else:
+                self.log(result.get("message") or "删掉了")
+            self._refresh_models()
+
+        background(self.conn.agent, "delete-model", "--path", model["path"], "--dirs", ",".join(self._model_dirs()), timeout=300,
+                   done=done, failed=self.fail("删除失败"))
 
     def _use_model_row(self, row, _column):
+        if not 0 <= row < len(self.models):
+            return
         path = self.models[row]["path"]
         index = self.serveModel.findData(path)
         if index >= 0:
