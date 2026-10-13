@@ -542,17 +542,28 @@ class MainWindow(QMainWindow):
         self.repo = QLineEdit()
         self.repo.setPlaceholderText("组织/名字，例如 Qwen/Qwen3.6-35B-A3B-FP8")
         self.repo.textChanged.connect(self._suggest_target)
+        self.repo.textChanged.connect(self._repo_changed)
         grid.addWidget(self.repo, 0, 1)
-        grid.addWidget(QLabel("下到"), 1, 0)
+        grid.addWidget(QLabel("量化版本"), 1, 0)
+        self.variant = QComboBox()
+        self.variant.activated.connect(self._pick_variant)
+        grid.addWidget(self.variant, 1, 1)
+        self.variantKey = None       # 列着量化版本的那个模型（来源、原版名），变了才重新找
+        self.variantTimer = QTimer(self)
+        self.variantTimer.setSingleShot(True)
+        self.variantTimer.setInterval(600)
+        self.variantTimer.timeout.connect(self._find_variants)
+        self.source.currentIndexChanged.connect(self._repo_changed)
+        grid.addWidget(QLabel("下到"), 2, 0)
         self.target = QLineEdit()
         self.target.setPlaceholderText("服务器上的目录")
-        grid.addWidget(self.target, 1, 1)
+        grid.addWidget(self.target, 2, 1)
         self.downloadButton = QPushButton("下载")
         self.downloadButton.clicked.connect(self._download)
         self.downloadStop = QPushButton("取消下载")
         self.downloadStop.clicked.connect(lambda: self._stop_job("download"))
         grid.addWidget(self.downloadButton, 0, 2)
-        grid.addWidget(self.downloadStop, 1, 2)
+        grid.addWidget(self.downloadStop, 2, 2)
         remoteLayout.addLayout(grid)
         self.downloadBar = QProgressBar()
         self.downloadBar.setRange(0, 1000)
@@ -647,12 +658,7 @@ class MainWindow(QMainWindow):
         if not cards:
             self.fitsGpu.setToolTip("没检测到这台服务器的显卡（没连上，或 AutoDL 无卡模式）")
         if self.fitsGpu.isChecked() and cards:
-            memory = sum(c["memory_total_mib"] for c in cards) * 1024 * 1024 * 0.9
-            try:
-                capability = min(float(c["compute_cap"]) for c in cards)
-            except ValueError:
-                capability = 0.0
-            models = [m for m in models if (not m.size or m.size <= memory) and capability >= catalog.QUANT_MIN_CAP.get(m.quant, 0)]
+            models = [m for m in models if not self._gpu_problem(m)]
         archs = self._engine_archs()
         self.engineSupported.setEnabled(bool(archs))
         if self.engineSupported.isChecked() and archs:
@@ -678,6 +684,76 @@ class MainWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.resultTable.setItem(row, column, item)
         self.resultCount.setText("显示 %d / 共 %d 个" % (len(models), len(self.resultsAll)) if self.resultsAll else "")
+
+    def _gpu_problem(self, model):
+        """这台的显卡跑不动这个模型的原因（量化方式不支持、放不下）；跑得动或不知道显卡时为空"""
+        cards = self.probe.get("gpus") or []
+        if not cards:
+            return ""
+        memory = sum(c["memory_total_mib"] for c in cards) * 1024 * 1024 * 0.9
+        try:
+            capability = min(float(c["compute_cap"]) for c in cards)
+        except ValueError:
+            capability = 0.0
+        if capability < catalog.QUANT_MIN_CAP.get(model.quant, 0):
+            return "这台的显卡不支持 %s" % model.quant
+        if model.size and model.size > memory:
+            return "显存放不下"
+        return ""
+
+    def _repo_changed(self, *_):
+        self.variantTimer.start()
+
+    def _find_variants(self):
+        """仓库填好后找同一个模型的原版和各种量化版，列进「量化版本」"""
+        repo = self.repo.text().strip()
+        source = self.source.currentData()
+        if "/" not in repo:
+            self.variant.clear()
+            self.variantKey = None
+            return
+        key = (source, catalog.base_name(repo).lower())
+        if key == self.variantKey:
+            self._select_variant(repo)
+            return
+        self.variantKey = key
+        self.variant.clear()
+        self.variant.addItem("在找 %s 的量化版本…" % catalog.base_name(repo))
+        self.variant.setEnabled(False)
+
+        def done(models):
+            if self.variantKey == key:
+                self._show_variants(models)
+
+        def failed(error):
+            if self.variantKey == key:
+                self.variantKey = None
+                self.variant.clear()
+                self.variant.addItem("没找到量化版本（%s）" % (str(error) or error.__class__.__name__))
+
+        background(catalog.variants, source, repo, done=done, failed=failed)
+
+    def _show_variants(self, models):
+        self.variant.clear()
+        for model in models:
+            problem = self._gpu_problem(model)
+            self.variant.addItem("%s · %s%s%s" % (model.quant, model.repo, "（%s）" % human(model.size) if model.size else "",
+                                                 " · " + problem if problem else ""), model.repo)
+        self.variant.setEnabled(len(models) > 1)
+        self.variant.setToolTip("没找到别的版本" if len(models) <= 1 else
+                                "同一个模型的原版和各种量化版（按名字找的，微调、蒸馏版不算），选一个就下它；"
+                                "同一种量化官方和常做量化版的排前面，再按下载量")
+        self._select_variant(self.repo.text().strip())
+
+    def _select_variant(self, repo):
+        index = self.variant.findData(repo)
+        if index >= 0:
+            self.variant.setCurrentIndex(index)
+
+    def _pick_variant(self, index):
+        repo = self.variant.itemData(index)
+        if repo and repo != self.repo.text().strip():
+            self.repo.setText(repo)
 
     def _pick_result(self):
         rows = self.resultTable.selectionModel().selectedRows()
@@ -829,11 +905,19 @@ class MainWindow(QMainWindow):
         self.forgetButton = QPushButton("删除记录")
         self.forgetButton.setToolTip("删掉停了的服务的记录和日志")
         self.forgetButton.clicked.connect(self._forget_service)
+        self.restartButton = QPushButton("重新启动")
+        self.restartButton.setToolTip("照上次的设置再起一次（停了、没起来、服务器重启过的服务）")
+        self.restartButton.clicked.connect(self._restart_service)
+        self.editButton = QPushButton("改设置…")
+        self.editButton.setToolTip("把这个服务的设置填进「新建服务」，改了再启动（模型名和端口不变就还是这个服务）")
+        self.editButton.clicked.connect(self._edit_service)
         newButton = QPushButton("新建服务…")
         newButton.clicked.connect(lambda: self.tabs.setCurrentIndex(3))
         self.serveStatus = QLabel()
         self.serveStatus.setWordWrap(True)
+        buttons.addWidget(self.restartButton)
         buttons.addWidget(self.stopButton)
+        buttons.addWidget(self.editButton)
         buttons.addWidget(self.forgetButton)
         buttons.addWidget(newButton)
         buttons.addWidget(self.serveStatus, 1)
@@ -925,6 +1009,7 @@ class MainWindow(QMainWindow):
             check.setProperty("memory", card["memory_total_mib"] * 1024 * 1024)
             owner = taken.get(card.get("index", position))
             check.setChecked(used < 0.1 and owner is None)
+            check.setProperty("taken", owner is not None)
             if owner is not None:
                 check.setText(check.text().split("（")[0] + "（%s 在用）" % owner)
                 check.setEnabled(False)
@@ -1001,7 +1086,7 @@ class MainWindow(QMainWindow):
         args = ["serve", "--engine", engine, "--model", path, "--name", name, "--host", self.serveHost.currentData(), "--port", self.servePort.value(),
                 "--gpu-util", "%.2f" % self.gpuUtil.value(), "--max-len", self.maxLen.value(), "--max-seqs", self.maxSeqs.value(),
                 "--tool-parser", self.toolParser.currentData(), "--reasoning-parser", self.reasoningParser.currentData(),
-                "--extra", self.extraArgs.text().strip()]
+                "--extra=" + self.extraArgs.text().strip()]
         if self.apiKey.text().strip():
             args += ["--key", self.apiKey.text().strip()]
         chosen = self._chosen_gpus()
@@ -1013,20 +1098,74 @@ class MainWindow(QMainWindow):
                      "--tp", self.tpSize.value(), "--dp", self.dpSize.value()]
         self.log("启动 %s：%s（端口 %d）" % (ENGINES[engine][0], path, self.servePort.value()))
 
-        def done(result):
-            if not result.get("ok"):
-                QMessageBox.warning(self, "启动失败", result.get("error") or "没能启动")
-                return
-            sid = result["id"]
-            self.log("服务 %s：工具调用解析 %s，思考解析 %s；加载模型、编译要几分钟" % (
-                sid, result.get("tool_parser") or "不开", result.get("reasoning_parser") or "不解析"))
-            self.selectedService = sid
-            self.watch = "serve:" + sid
-            self.offsets[self.watch] = 0
-            self.tabs.setCurrentIndex(4)
-            self._poll()
+        background(self.conn.agent, *args, done=self._serve_started, failed=self.fail("启动失败"))
 
-        background(self.conn.agent, *args, done=done, failed=self.fail("启动失败"))
+    def _serve_started(self, result):
+        if not result.get("ok"):
+            QMessageBox.warning(self, "启动失败", result.get("error") or "没能启动")
+            self._update_addresses()
+            return
+        sid = result["id"]
+        self.log("服务 %s：工具调用解析 %s，思考解析 %s；加载模型、编译要几分钟" % (
+            sid, result.get("tool_parser") or "不开", result.get("reasoning_parser") or "不解析"))
+        self.selectedService = sid
+        self.watch = "serve:" + sid
+        self.offsets[self.watch] = 0
+        self.tabs.setCurrentIndex(4)
+        self._poll()
+
+    def _restart_service(self):
+        service = self._service()
+        if not service:
+            return
+        self.log("重新启动服务 %s" % service["id"])
+        self.restartButton.setEnabled(False)
+        background(self.conn.agent, "restart", "--id", service["id"], done=self._serve_started, failed=self.fail("启动失败"))
+
+    def _edit_service(self):
+        """把选中服务的设置填进「新建服务」页"""
+        service = self._service()
+        if not service:
+            return
+        # 早先的记录没存 options：用记下的那几项
+        options = dict(service.get("options") or {})
+        for name in ("engine", "model", "name", "host", "port", "key", "tp", "dp"):
+            options.setdefault(name, service.get(name))
+        options.setdefault("gpus", ",".join(str(i) for i in service.get("gpus") or []))
+        options.setdefault("tool_parser", service.get("tool_parser") or "none")
+        options.setdefault("reasoning_parser", service.get("reasoning_parser") or "none")
+        for combo, value in ((self.serveEngine, options.get("engine") or "vllm"), (self.serveModel, options.get("model")),
+                             (self.serveHost, options.get("host"))):
+            index = combo.findData(value)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        if self.serveModel.currentData() != options.get("model"):
+            self.log("服务器上的模型列表里没有 %s（被删了，或不在列的目录里）" % options.get("model"))
+        self.serveName.setText(options.get("name") or "")
+        if options.get("port"):
+            self.servePort.setValue(int(options["port"]))
+        if options.get("key"):
+            self.apiKey.setText(options["key"])
+        for spin, name in ((self.gpuUtil, "gpu_util"), (self.maxLen, "max_len"), (self.maxSeqs, "max_seqs")):
+            if options.get(name) is not None:
+                spin.setValue(type(spin.value())(options[name]))
+        for combo, name in ((self.toolParser, "tool_parser"), (self.reasoningParser, "reasoning_parser")):
+            index = combo.findData(options.get(name) or "none")
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        self.extraArgs.setText(options.get("extra") or "")
+        gpus = {int(i) for i in str(options.get("gpus") or "").split(",") if i.strip()}
+        if gpus:
+            for check in self.gpuChecks:
+                check.blockSignals(True)
+                check.setChecked(not check.property("taken") and check.property("index") in gpus)
+                check.blockSignals(False)
+        for spin, name in ((self.tpSize, "tp"), (self.dpSize, "dp")):
+            spin.blockSignals(True)
+            spin.setValue(int(options.get(name) or 1))
+            spin.blockSignals(False)
+        self._parallel_summary()
+        self.tabs.setCurrentIndex(3)
 
     def _service(self):
         return self.services.get(self.selectedService) or {}
@@ -1163,6 +1302,8 @@ class MainWindow(QMainWindow):
         service = self._service()
         running = service.get("status") == "running"
         self.stopButton.setEnabled(running)
+        self.restartButton.setEnabled(bool(service) and not running and bool(self.conn))
+        self.editButton.setEnabled(bool(service))
         self.forgetButton.setEnabled(bool(service) and not running)
         self.tunnelButton.setEnabled(running)
         self.testButton.setEnabled(running)

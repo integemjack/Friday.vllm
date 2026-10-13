@@ -21,8 +21,9 @@ SORTS = {
     "stars": ("收藏数", "StarsCount", "likes"),
 }
 PAGE_SIZE = 100
-# 不是给 N 卡上的 vLLM / SGLang 用的：GGUF、MLX 这类格式，昇腾 NPU、手机芯片的转换版
-NOT_FOR_VLLM = re.compile(r"(gguf|mlx|onnx|openvino|coreml|exl2|ggml|npu|ascend|310p|910b|mindie|rknn|qnn)", re.IGNORECASE)
+# 不是给 N 卡上的 vLLM / SGLang 用的：GGUF、MLX 这类格式，昇腾 NPU、海光 / 沐曦 / 天数这类国产卡、手机芯片的转换版
+NOT_FOR_VLLM = re.compile(r"(gguf|mlx|onnx|openvino|coreml|exl2|ggml|npu|ascend|310p|910b|mindie|rknn|qnn|hygon|metax|iluvatar|corex|"
+                          r"cambricon|enflame|kunlunxin)", re.IGNORECASE)
 # 量化方式：按仓库名认（顺序要紧：NVFP4 先于 FP8 之类）
 QUANTS = [
     ("NVFP4", re.compile(r"nvfp4|(?<![a-z])fp4|mxfp4", re.IGNORECASE)),
@@ -48,6 +49,14 @@ SUGGESTED = [
 ]
 
 
+# 量化版的名字在原版后面加的、本身不是量化方式的词（FP8-dynamic、AWQ-4bit、int4-AutoRound、SF-FP8-WC……）
+QUANT_EXTRA_WORDS = {"dynamic", "static", "fast", "autoround", "mixed", "sf", "wc", "channel", "block", "quantized", "quant", "nf4",
+                     "g128", "g64", "g32", "sym", "asym", "marlin", "gemm", "gemv", "compressed", "tensors"}
+# 同一个量化方式有好几家时排前面的：官方、常做量化版的
+TRUSTED = ["Qwen", "deepseek-ai", "nvidia", "RedHatAI", "QuantTrio", "unsloth", "Intel", "meta-llama", "mistralai", "zai-org", "moonshotai",
+           "openai", "google"]
+
+
 def quant_of(repo):
     for name, pattern in QUANTS:
         if pattern.search(repo):
@@ -64,6 +73,44 @@ class Model:
         self.updated = updated      # 秒（Unix 时间）；不知道为 0
         self.stars = stars
         self.quant = quant_of(repo)
+
+
+def base_name(repo):
+    """仓库名去掉末尾的量化后缀：Qwen/Qwen3.6-35B-A3B-FP8 → Qwen3.6-35B-A3B；不是量化版的原样"""
+    parts = re.split(r"([-_])", repo.split("/")[-1])
+    end = len(parts)
+    while end >= 3:
+        word = parts[end - 1]
+        if not (word.lower() in QUANT_EXTRA_WORDS or any(pattern.fullmatch(word) or pattern.search(word) for _, pattern in QUANTS)):
+            break
+        end -= 2
+    return "".join(parts[:end])
+
+
+def variants(source, repo):
+    """同一个模型的各种量化版（含原版）：按原版的名字搜，名字是「原版名 + 量化后缀」的才算（微调、蒸馏版不算）。
+    按量化方式排（原版、NVFP4、FP8……），同一种里官方和常做量化版的在前、再按下载量"""
+    base = base_name(repo)
+    found = {m.repo: m for m in search(source, base, "downloads") if base_name(m.repo).lower() == base.lower()}
+    if repo not in found:
+        found[repo] = info(source, repo) or Model(repo)
+    models = list(found.values())
+    # Hugging Face 的搜索结果没有大小：一个个查（并行）
+    missing = [m for m in models if not m.size][:24]
+    if missing:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(8) as pool:
+            for model, detail in zip(missing, pool.map(lambda m: info(source, m.repo), missing)):
+                if detail:
+                    model.size, model.architectures = detail.size, detail.architectures or model.architectures
+    order = {name: index for index, name in enumerate(QUANT_NAMES)}
+    owner = repo.split("/")[0]
+
+    def rank(model):
+        org = model.repo.split("/")[0]
+        trust = 0 if org == owner else 1 + TRUSTED.index(org) if org in TRUSTED else 99
+        return order.get(model.quant, 99), trust, -(model.downloads or 0)
+    return sorted(models, key=rank)
 
 
 def _get(url, method="GET", body=None, timeout=20):

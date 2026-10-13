@@ -1058,8 +1058,44 @@ def cmd_serve(args):
     write_json(service_path(args.base, sid),
                {"id": sid, "status": "running", "pid": child.pid, "started": time.time(), "log": log_path, "port": args.port, "host": args.host,
                 "engine": args.engine, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp,
-                "key": args.key, "name": args.name, "model": model, "tool_parser": tool, "reasoning_parser": reasoning})
+                "key": args.key, "name": args.name, "model": model, "tool_parser": tool, "reasoning_parser": reasoning,
+                "options": serve_options(args)})
     emit({"ok": True, "id": sid, "pid": child.pid, "tool_parser": tool, "reasoning_parser": reasoning, "gpus": chosen[:tp * dp], "tp": tp, "dp": dp})
+
+
+# 启动时的选项原样记进服务记录：停了以后「重新启动」照它再起一次
+SERVE_OPTIONS = ("engine", "model", "name", "host", "port", "key", "gpu_util", "max_len", "max_seqs", "tool_parser", "reasoning_parser",
+                 "extra", "gpus", "tp", "dp")
+
+
+def serve_options(args):
+    return {name: getattr(args, name) for name in SERVE_OPTIONS}
+
+
+def cmd_restart(args):
+    """照服务记录里的选项再起一次（停了、没起来、机器重启过的服务）"""
+    migrate_single_service(args.base)
+    state = read_json(service_path(args.base, args.id))
+    if not state:
+        emit({"ok": False, "error": "没有服务 %s" % args.id})
+        return
+    if state.get("status") == "running" and alive(state.get("pid")):
+        emit({"ok": False, "error": "服务 %s 还在跑" % args.id})
+        return
+    # 0.1.2 之前的记录没存选项：用记下的那几项，其余按缺省
+    options = {"engine": "vllm", "host": "0.0.0.0", "port": 8000, "key": None, "gpu_util": 0.9, "max_len": 0, "max_seqs": 256,
+               "tool_parser": state.get("tool_parser") or "none", "reasoning_parser": state.get("reasoning_parser") or "none",
+               "extra": "", "tp": 1, "dp": 1}
+    options.update({k: state[k] for k in ("engine", "model", "name", "host", "port", "key", "tp", "dp") if state.get(k) is not None})
+    options["gpus"] = ",".join(str(i) for i in state.get("gpus") or [])
+    options.update(state.get("options") or {})
+    if not options.get("model") or not options.get("name"):
+        emit({"ok": False, "error": "服务 %s 的记录里没有模型或模型名，到「新建服务」里重新开" % args.id})
+        return
+    for name, value in options.items():
+        setattr(args, name, value)
+    args.port = int(args.port)
+    cmd_serve(args)
 
 
 # ── 入口 ──
@@ -1105,6 +1141,8 @@ def main():
     command.add_argument("--gpus", default="", help="用哪几张显卡（nvidia-smi 的编号，逗号分开；不给 = 全部）")
     command.add_argument("--tp", type=int, default=1, help="张量并行：一份模型切到几张卡上")
     command.add_argument("--dp", type=int, default=1, help="数据并行：开几份副本")
+    command = add("restart", cmd_restart)
+    command.add_argument("--id", required=True)
     command = add("stop", cmd_stop)
     command.add_argument("--job", default="serve")
     command.add_argument("--id", default="")
