@@ -68,6 +68,36 @@ CONNECTIONS = 16          # 同时开的连接
 DNS_TTL = 300             # 域名解析结果缓存多久（秒）
 
 
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    """Python 3.11 之前的 urllib 不跟 308 跳转（hf-mirror 的列文件接口会 308 跳回 huggingface.co）"""
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        # 老版本的 redirect_request 只认 301/302/303/307：308 当 307 处理（同样不改方法、不丢请求体）
+        return self.http_error_302(req, fp, 307, msg, headers)
+
+
+_openers = []                # 经本机中转时每个代理一个
+_local = threading.local()
+_turn = [0]
+
+
+def setup_http(proxies=()):
+    """装上认 308 的 opener；给了代理（本机中转的几个端口）就每个代理一个 opener，各个下载线程轮流分到一个"""
+    _openers[:] = [urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}), _Redirect)
+                   for proxy in proxies]
+    urllib.request.install_opener(_openers[0] if _openers else urllib.request.build_opener(_Redirect))
+
+
+def urlopen(request, timeout):
+    if not _openers:
+        return urllib.request.urlopen(request, timeout=timeout)
+    opener = getattr(_local, "opener", None)
+    if opener is None:
+        _turn[0] += 1
+        opener = _local.opener = _openers[_turn[0] % len(_openers)]
+    return opener.open(request, timeout=timeout)
+
+
 def cache_dns():
     """下载时缓存域名解析：16 个连接、每段都查 modelscope.cn 和它跳转到的 CDN，查得太多；
     AutoDL 的 DNS 只等 1 秒、不重试（resolv.conf 的 timeout:1 attempts:1），常常报 Temporary failure in name resolution。
@@ -96,7 +126,7 @@ def final_url(url):
     """跟着跳转找到真正的下载地址（魔搭的 resolve 会跳到 CDN 上带签名的地址）：之后各段直接用它，少一半请求"""
     request = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": "friday-vllm/" + VERSION})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=30) as response:
             return response.geturl() or url
     except Exception:  # noqa: BLE001
         return url
@@ -104,13 +134,23 @@ def final_url(url):
 
 # ── 小工具 ──
 
+# 在本机界面里直接调用时（没连服务器、下到这台电脑上），输出交给它：sink({"event": "progress" | "log", …})
+sink = None
+
+
 def emit(obj):
     """一行 JSON（界面按行解析）"""
+    if sink:
+        sink(obj)
+        return
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
 def log(text):
+    if sink:
+        sink({"event": "log", "text": time.strftime("%H:%M:%S ") + text})
+        return
     sys.stdout.write(time.strftime("%H:%M:%S ") + text + "\n")
     sys.stdout.flush()
 
@@ -630,8 +670,18 @@ def http_json(url, method="GET", body=None, timeout=30):
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json",
                                                                              "User-Agent": "friday-vllm/" + VERSION})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    # 偶发断开（DNS、TLS 握手被掐、中转那头的网抖一下）重试几次；404 这类不重试
+    for attempt in range(4):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code < 500 or attempt == 3:
+                raise
+        except (OSError, ValueError):
+            if attempt == 3:
+                raise
+        time.sleep(2 ** attempt)
 
 
 def list_files(source, repo, revision):
@@ -710,7 +760,7 @@ def fetch_range(source, start, end, out_path, progress, name, stop):
         try:
             url = source["url"]
             request = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (position, end), "User-Agent": "friday-vllm/" + VERSION})
-            with urllib.request.urlopen(request, timeout=60) as response, open(out_path, "r+b") as f:
+            with urlopen(request, timeout=60) as response, open(out_path, "r+b") as f:
                 if response.status != 206 and (position != 0 or response.headers.get("Content-Length") not in (None, str(end - position + 1))):
                     raise RuntimeError("服务器不支持分段下载（HTTP %d）" % response.status)
                 f.seek(position)
@@ -759,6 +809,10 @@ def download_file(source, repo, revision, item, target, progress, pool_size, sto
     os.makedirs(os.path.dirname(path), exist_ok=True)
     origin = file_url(source, repo, revision, name)
     url = {"url": final_url(origin) if size > CHUNK else origin, "origin": origin}
+    if size > CHUNK:
+        # 实际从哪下：镜像站可能再跳到别处（hf-mirror 会跳到 Hugging Face 的 CDN），签名参数不记
+        actual = url["url"].split("?")[0]
+        log("%s：%s%s" % (name, origin, "\n    实际从 %s 下" % actual if actual != origin else ""))
     if size <= CHUNK:
         # 小文件：一次下完
         with open(part, "wb"):
@@ -816,7 +870,7 @@ def download_file(source, repo, revision, item, target, progress, pool_size, sto
 
 def fetch_whole(url, path):
     request = urllib.request.Request(url, headers={"User-Agent": "friday-vllm/" + VERSION})
-    with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as f:
+    with urlopen(request, timeout=60) as response, open(path, "wb") as f:
         shutil.copyfileobj(response, f)
     return True
 
@@ -825,40 +879,56 @@ def cmd_download(args):
     if not args.foreground:
         argv = ["download", "--base", args.base, "--repo", args.repo, "--source", args.source, "--dir", args.dir,
                 "--revision", args.revision or ""]
+        if args.proxy:
+            argv += ["--proxy", args.proxy]
         for pattern in args.include or []:
             argv += ["--include", pattern]
         return start_job(args.base, "download", argv)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     cache_dns()
+    if args.proxy:
+        # 经本机中转：请求走 SSH 远程转发过来的几个代理端口（每条 SSH 连接一个，各个下载线程轮流用）
+        proxies = [p for p in args.proxy.split(",") if p]
+        setup_http(proxies)
+        log("经本机中转下载（%d 条线路）：本机的窗口要开着、连着这台服务器；断了重新点下载会接着下" % len(proxies))
     try:
-        target = os.path.abspath(os.path.expanduser(args.dir))
-        log("列 %s 上 %s 的文件" % (args.source, args.repo))
-        files = wanted(list_files(args.source, args.repo, args.revision), args.include or [], DEFAULT_EXCLUDE)
-        if not any(f["path"].endswith(".safetensors") for f in files):
-            raise RuntimeError("这个仓库里没有 safetensors 权重，vLLM 用不了（GGUF 请用 Friday 的本地模型）")
-        total = sum(f["size"] for f in files)
-        free = disk_free(target)
-        if free and free["free"] < total:
-            raise RuntimeError("%s 只剩 %s，模型要 %s" % (free["path"], human(free["free"]), human(total)))
-        log("%d 个文件，共 %s，下到 %s" % (len(files), human(total), target))
-        write_json(os.path.join(paths(args.base)["state"], "download.json"),
-                   dict(read_json(os.path.join(paths(args.base)["state"], "download.json"), {}), repo=args.repo, dir=target, total=total))
-        progress = Progress(total)
-        # 大文件一个个来、每个分段并行；小文件一起下
-        for item in sorted(files, key=lambda f: f["size"]):
-            if stop.is_set():
-                raise RuntimeError("已取消")
-            if not download_file(args.source, args.repo, args.revision, item, target, progress, CONNECTIONS, stop):
-                raise RuntimeError("已取消" if stop.is_set() else "%s 下载失败" % item["path"])
-        with open(os.path.join(target, ".friday-vllm.json"), "w", encoding="utf-8") as f:
-            json.dump({"repo": args.repo, "source": args.source, "downloaded": time.time()}, f, ensure_ascii=False)
-        emit({"event": "progress", "done": total, "total": total, "speed": 0, "file": ""})
+        state = os.path.join(paths(args.base)["state"], "download.json")
+        target = download_repo(args.source, args.repo, args.dir, args.revision, args.include, stop,
+                               started=lambda target, total: write_json(state, dict(read_json(state, {}), repo=args.repo, dir=target, total=total)))
         finish_job(args.base, "download", True, "%s 下好了" % args.repo, dir=target)
-        log("完成：%s" % target)
     except Exception as error:  # noqa: BLE001
         log("失败：%s" % error)
         finish_job(args.base, "download", False, str(error))
+
+
+def download_repo(source, repo, directory, revision, include, stop, started=None):
+    """列文件、查磁盘、一个个下、写 .friday-vllm.json，返回下到的目录；失败抛异常。
+    服务器上的 download 任务和本机界面（没连服务器时下到这台电脑上）都用它"""
+    target = os.path.abspath(os.path.expanduser(directory))
+    log("列 %s 上 %s 的文件" % (source, repo))
+    files = wanted(list_files(source, repo, revision), include or [], DEFAULT_EXCLUDE)
+    if not any(f["path"].endswith(".safetensors") for f in files):
+        raise RuntimeError("这个仓库里没有 safetensors 权重，vLLM 用不了（GGUF 请用 Friday 的本地模型）")
+    total = sum(f["size"] for f in files)
+    free = disk_free(target)
+    if free and free["free"] < total:
+        raise RuntimeError("%s 只剩 %s，模型要 %s" % (free["path"], human(free["free"]), human(total)))
+    log("%d 个文件，共 %s，下到 %s" % (len(files), human(total), target))
+    if started:
+        started(target, total)
+    progress = Progress(total)
+    # 大文件一个个来、每个分段并行；小文件一起下
+    for item in sorted(files, key=lambda f: f["size"]):
+        if stop.is_set():
+            raise RuntimeError("已取消")
+        if not download_file(source, repo, revision, item, target, progress, CONNECTIONS, stop):
+            raise RuntimeError("已取消" if stop.is_set() else "%s 下载失败" % item["path"])
+    with open(os.path.join(target, ".friday-vllm.json"), "w", encoding="utf-8") as f:
+        json.dump({"repo": repo, "source": source, "downloaded": time.time()}, f, ensure_ascii=False)
+    emit({"event": "progress", "done": total, "total": total, "speed": 0, "file": ""})
+    log("完成：%s" % target)
+    return target
 
 
 # ── models ──
@@ -1160,6 +1230,7 @@ def main():
     command.add_argument("--dir", required=True)
     command.add_argument("--revision", default="")
     command.add_argument("--include", action="append")
+    command.add_argument("--proxy", default="", help="经这个 HTTP 代理下载（本机中转时是 SSH 远程转发过来的端口）")
     command = add("models", cmd_models)
     command.add_argument("--dirs", default="")
     command = add("delete-model", cmd_delete_model)
@@ -1192,6 +1263,7 @@ def main():
     command.add_argument("--job", required=True)
     command.add_argument("--offset", type=int, default=-1)
     args = parser.parse_args()
+    setup_http()
     # 后台任务的工作目录是 base：相对路径都先转成绝对的
     args.base = os.path.abspath(os.path.expanduser(args.base))
     for name in ("dir", "model", "path"):

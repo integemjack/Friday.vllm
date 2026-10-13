@@ -4,20 +4,24 @@ Friday 本身不用改：把这里给的地址、密钥、模型名填进 Friday
 """
 import json
 import os
+import fnmatch
 import secrets
 import shlex
 import sys
+import threading
 import time
 import urllib.request
 
 from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
-                               QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+                               QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
                                QWidget)
 
 from . import __version__, catalog
+from .agent import agent as agentlib
+from .agent.agent import DEFAULT_EXCLUDE
 from .ssh import Connection, HostKeyQuestion, free_local_port
 from .worker import background
 
@@ -54,6 +58,47 @@ def duration(seconds):
     return "%d 秒" % seconds
 
 
+def local_model_files(folder):
+    """本机模型目录里要传的文件 [(本机路径, 相对路径, 大小)]：跟服务器上下载时一样不要 GGUF、原始权重、重复的 PyTorch 权重，
+    隐藏目录（.cache、.git）和没下完的不要"""
+    files = []
+    for root, dirs, names in os.walk(folder, followlinks=True):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, folder).replace(os.sep, "/")
+            if name.startswith(".") or name.endswith((".part", ".partdone", ".incomplete", ".lock")):
+                continue
+            if any(fnmatch.fnmatch(rel, pattern) for pattern in DEFAULT_EXCLUDE):
+                continue
+            try:
+                files.append((path, rel, os.path.getsize(path)))
+            except OSError:
+                continue
+    if any(rel.endswith(".safetensors") for _, rel, _ in files):
+        files = [f for f in files if not (f[1].startswith("pytorch_model") and f[1].endswith(".bin")) and not f[1].endswith(".bin.index.json")]
+    return files
+
+
+def guess_repo(folder):
+    """本机模型目录对应的仓库名（组织/名字）：Hugging Face 缓存（models--组织--名字/snapshots/…）、魔搭缓存（…/组织/名字）、
+    之前下载时记的；认不出来用目录名"""
+    parts = os.path.normpath(os.path.abspath(folder)).split(os.sep)
+    for part in parts:
+        if part.startswith("models--") and "--" in part[8:]:
+            return part[8:].replace("--", "/", 1)
+    try:
+        with open(os.path.join(folder, ".friday-vllm.json"), encoding="utf-8") as f:
+            repo = json.load(f).get("repo") or ""
+        if "/" in repo:
+            return repo
+    except (OSError, ValueError):
+        pass
+    if "modelscope" in (p.lower() for p in parts) and len(parts) >= 2:
+        return "%s/%s" % (parts[-2], parts[-1])
+    return parts[-1]
+
+
 def copy_button(source):
     """「复制」按钮：source 是取文字的函数"""
     button = QPushButton("复制")
@@ -88,11 +133,17 @@ class MainWindow(QMainWindow):
         self.download_started = None
 
         tabs = QTabWidget()
+        self.installPage = self._install_tab()
+        self.modelsPage = self._models_tab()
+        self.downloadPage = self._download_tab()
+        self.servePage = self._serve_tab()
+        self.servicesPage = self._services_tab()
         tabs.addTab(self._server_tab(), "服务器")
-        tabs.addTab(self._install_tab(), "安装引擎")
-        tabs.addTab(self._models_tab(), "模型")
-        tabs.addTab(self._serve_tab(), "新建服务")
-        tabs.addTab(self._services_tab(), "服务")
+        tabs.addTab(self.installPage, "安装引擎")
+        tabs.addTab(self.modelsPage, "模型管理")
+        tabs.addTab(self.downloadPage, "下载模型")
+        tabs.addTab(self.servePage, "新建服务")
+        tabs.addTab(self.servicesPage, "服务")
         self.tabs = tabs
 
         self.logView = QPlainTextEdit()
@@ -336,8 +387,10 @@ class MainWindow(QMainWindow):
         self.disconnectButton.setEnabled(connected)
         for widget in (self.host, self.port, self.user, self.password, self.keyFile, self.base, self.profile):
             widget.setEnabled(not connected)
-        for index in (1, 2, 3, 4):
-            self.tabs.widget(index).setEnabled(connected)
+        # 「下载模型」没连也能用：下到这台电脑上
+        for page in (self.installPage, self.modelsPage, self.servePage, self.servicesPage):
+            page.setEnabled(connected)
+        self._download_place()
         if connected:
             self.statusBar().showMessage("已连上 %s@%s（工作目录 %s）" % (self.conn.user, self.conn.host, self.conn.base))
         else:
@@ -493,9 +546,14 @@ class MainWindow(QMainWindow):
         modelButtons.addWidget(hint, 1)
         localLayout.addLayout(modelButtons)
         self._model_selection_changed()
-        layout.addWidget(local, 2)
+        layout.addWidget(local)
+        return page
 
+    def _download_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
         remote = QGroupBox("下载模型（下到服务器上）")
+        self.downloadBox = remote
         remoteLayout = QVBoxLayout(remote)
         searchRow = QHBoxLayout()
         self.source = QComboBox()
@@ -568,20 +626,46 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("下到"), 2, 0)
         self.target = QLineEdit()
         self.target.setPlaceholderText("服务器上的目录")
-        grid.addWidget(self.target, 2, 1)
+        self.browseTarget = QPushButton("选目录…")
+        self.browseTarget.setToolTip("没连服务器时模型下到这台电脑上：选放模型的目录（下到 <目录>/<组织>/<名字>）")
+        self.browseTarget.clicked.connect(self._pick_local_dir)
+        targetRow = QHBoxLayout()
+        targetRow.addWidget(self.target, 1)
+        targetRow.addWidget(self.browseTarget)
+        grid.addLayout(targetRow, 2, 1)
         self.downloadButton = QPushButton("下载")
         self.downloadButton.clicked.connect(self._download)
         self.downloadStop = QPushButton("取消下载")
-        self.downloadStop.clicked.connect(lambda: self._stop_job("download"))
+        self.downloadStop.clicked.connect(self._cancel_download)
         grid.addWidget(self.downloadButton, 0, 2)
         grid.addWidget(self.downloadStop, 2, 2)
+        self.viaLabel = QLabel("下载方式")
+        grid.addWidget(self.viaLabel, 3, 0)
+        self.downloadVia = QComboBox()
+        self.downloadVia.addItem("服务器直接下", "direct")
+        self.downloadVia.addItem("经本机中转（服务器走这台电脑的网络下，本机有代理也走代理；窗口要开着）", "relay")
+        self.downloadVia.setToolTip("服务器上下不动（Hugging Face 被墙、镜像跳到国外 CDN）时用：SSH 远程转发在服务器上开一个代理端口，"
+                                    "下载请求经它从这台电脑出去。服务器那边照样多连接、断点续传；速度看这台电脑的网和上行带宽")
+        index = self.downloadVia.findData(self.settings.value("downloadVia", "direct"))
+        self.downloadVia.setCurrentIndex(max(0, index))
+        grid.addWidget(self.downloadVia, 3, 1)
+        self.uploadButton = QPushButton("从本机上传…")
+        self.uploadButton.setToolTip("选这台电脑上已经下好的模型文件夹（有 config.json 和 safetensors），传到服务器上；断了重新传会接着传")
+        self.uploadButton.clicked.connect(self._upload_model)
+        grid.addWidget(self.uploadButton, 3, 2)
+        # 在本机跑的传输（上传到服务器、没连服务器时下到这台电脑上）：{"kind", "stop", "done", "total", "file", "lines", 速度窗口}
+        self.transfer = None
+        self.relayReopening = False
+        self.transferTimer = QTimer(self)
+        self.transferTimer.setInterval(500)
+        self.transferTimer.timeout.connect(self._show_transfer)
         remoteLayout.addLayout(grid)
         self.downloadBar = QProgressBar()
         self.downloadBar.setRange(0, 1000)
         self.downloadText = QLabel()
         remoteLayout.addWidget(self.downloadBar)
         remoteLayout.addWidget(self.downloadText)
-        layout.addWidget(remote, 3)
+        layout.addWidget(remote)
         return page
 
     @staticmethod
@@ -668,7 +752,7 @@ class MainWindow(QMainWindow):
         index = self.serveModel.findData(path)
         if index >= 0:
             self.serveModel.setCurrentIndex(index)
-            self.tabs.setCurrentIndex(3)   # 新建服务
+            self.tabs.setCurrentWidget(self.servePage)
 
     def _search(self):
         source = self.source.currentData()
@@ -809,24 +893,216 @@ class MainWindow(QMainWindow):
         if rows:
             self.repo.setText(self.results[rows[0].row()].repo)
 
+    def _local_dir(self):
+        return self.settings.value("localModelDir", "") or os.path.join(os.path.expanduser("~"), "Models")
+
     def _suggest_target(self, repo):
-        if self.conn and repo.strip():
-            self.target.setText("%s/models/%s" % (self.conn.base.rstrip("/"), repo.strip()))
+        repo = repo.strip()
+        if not repo:
+            return
+        if self.conn:
+            self.target.setText("%s/models/%s" % (self.conn.base.rstrip("/"), repo))
+        else:
+            self.target.setText(os.path.normpath(os.path.join(self._local_dir(), *repo.split("/"))))
+
+    def _download_place(self):
+        """连着服务器：下到服务器上；没连：只能下到这台电脑上你选的目录"""
+        connected = bool(self.conn)
+        self.downloadBox.setTitle("下载模型（下到服务器上）" if connected else "下载模型（没连服务器：下到这台电脑上）")
+        self.target.setPlaceholderText("服务器上的目录" if connected else "这台电脑上的目录")
+        self.browseTarget.setVisible(not connected)
+        self.viaLabel.setVisible(connected)
+        self.downloadVia.setVisible(connected)
+        self.uploadButton.setToolTip("选这台电脑上已经下好的模型文件夹（有 config.json 和 safetensors），传到服务器上；断了重新传会接着传"
+                                     if connected else "连上服务器后才能传")
+        self.target.clear()
+        self._suggest_target(self.repo.text())
+        self._transfer_buttons()
+
+    def _pick_local_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "模型下到这台电脑上的哪个目录", self._local_dir())
+        if folder:
+            self.settings.setValue("localModelDir", folder)
+            self._suggest_target(self.repo.text())
+            if not self.repo.text().strip():
+                self.target.setText(os.path.normpath(folder))
 
     def _download(self):
         repo = self.repo.text().strip()
         target = self.target.text().strip()
         if "/" not in repo or not target:
-            QMessageBox.information(self, APP, "填仓库（组织/名字）和服务器上的目录")
+            QMessageBox.information(self, APP, "填仓库（组织/名字）和%s的目录" % ("服务器上" if self.conn else "这台电脑上"))
             return
+        if not self.conn:
+            self._download_local(repo, target)
+            return
+        via = self.downloadVia.currentData()
+        self.settings.setValue("downloadVia", via)
         self.offsets["download"] = 0
         self.watch = "download"
         self.download_started = time.time()
         self.downloadBar.setValue(0)
         self.downloadText.setText("开始下载…")
-        self.log("下载 %s → %s（%s）" % (repo, target, self.source.currentText()))
-        background(self.conn.agent, "download", "--repo", repo, "--source", self.source.currentData(), "--dir", target,
-                   done=self._job_started("下载"), failed=self.fail("下载失败"))
+        self.downloadButton.setEnabled(False)
+        self.log("下载 %s → %s（%s%s）" % (repo, target, self.source.currentText(), "，经本机中转" if via == "relay" else ""))
+        conn = self.conn
+
+        def work():
+            args = ["download", "--repo", repo, "--source", self.source.currentData(), "--dir", target]
+            if via == "relay":
+                args += ["--proxy", ",".join("http://127.0.0.1:%d" % port for port in conn.open_relay())]
+            else:
+                conn.close_relay()
+            return conn.agent(*args)
+
+        def failed(error):
+            self.downloadButton.setEnabled(True)
+            self.fail("下载失败")(error)
+
+        background(work, done=self._job_started("下载"), failed=failed)
+
+    def _cancel_download(self):
+        if self.transfer:
+            self.transfer["stop"].set()
+            self.downloadText.setText("正在取消…")
+            return
+        self._stop_job("download")
+
+    # ── 没连服务器：下到这台电脑上 ──
+
+    def _download_local(self, repo, target):
+        if self.transfer:
+            return
+        if not os.path.isabs(target):
+            QMessageBox.information(self, APP, "「下到」要填这台电脑上的完整路径")
+            return
+        source = self.source.currentData()
+        state = self._start_transfer("local", 0)
+        self.log("下载 %s → 这台电脑的 %s（%s）" % (repo, target, self.source.currentText()))
+
+        def sink(event):
+            with state["lock"]:
+                if event.get("event") == "progress":
+                    state["done"], state["total"], state["file"] = event.get("done") or 0, event.get("total") or 0, event.get("file") or ""
+                elif event.get("event") == "log":
+                    state["lines"].append(event["text"])
+
+        def work():
+            # 只用 agent.py 的下载部分（和服务器上一样：多连接分段、断点续传、校验）；输出交给界面
+            agentlib.sink = sink
+            agentlib.setup_http()
+            try:
+                return agentlib.download_repo(source, repo, target, "", [], state["stop"])
+            finally:
+                agentlib.sink = None
+
+        def done(directory):
+            self.settings.setValue("uploadFrom", os.path.dirname(directory))
+            self._finish_transfer("下好了：%s（连上服务器后可以「从本机上传…」传上去）" % directory, True)
+
+        background(work, done=done,
+                   failed=lambda error: self._finish_transfer("下载%s：%s" % ("已取消" if state["stop"].is_set() else "失败", error), False))
+
+    # ── 从本机上传 ──
+
+    def _upload_model(self):
+        if not self.conn or self.transfer:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "选本机上的模型文件夹（有 config.json 和 safetensors 的那层）",
+                                                  self.settings.value("uploadFrom", ""))
+        if not folder:
+            return
+        self.settings.setValue("uploadFrom", os.path.dirname(folder))
+        files = local_model_files(folder)
+        names = {rel for _, rel, _ in files}
+        if "config.json" not in names or not any(n.endswith(".safetensors") for n in names):
+            QMessageBox.information(self, APP, "%s 里没有 config.json 和 safetensors 权重，vLLM / SGLang 用不了。\n\n"
+                                               "要选模型本身那层文件夹（Hugging Face 缓存是 models--组织--名字/snapshots/<一串字符>）。" % folder)
+            return
+        total = sum(size for _, _, size in files)
+        repo = guess_repo(folder)
+        default = "%s/models/%s" % (self.conn.base.rstrip("/"), repo)
+        target, ok = QInputDialog.getText(self, "从本机上传", "%s\n%d 个文件，共 %s\n\n传到服务器上的目录：" % (folder, len(files), human(total)),
+                                          QLineEdit.Normal, default)
+        target = target.strip().rstrip("/")
+        if not ok or not target:
+            return
+        state = self._start_transfer("upload", total)
+        self.log("上传 %s → %s（%d 个文件，%s）" % (folder, target, len(files), human(total)))
+        conn = self.conn
+
+        def progress(n, name):
+            with state["lock"]:
+                state["done"] += n
+                state["file"] = name
+
+        def work():
+            free = conn.remote_free(target)
+            if free is not None and free < total:
+                raise RuntimeError("服务器上 %s 所在的盘只剩 %s，模型要 %s" % (target, human(free), human(total)))
+            conn.upload(files, target, progress, state["stop"])
+            conn.write_file(target + "/.friday-vllm.json",
+                            json.dumps({"repo": repo, "source": "upload", "from": folder, "downloaded": time.time()}, ensure_ascii=False))
+
+        def done(_):
+            self._finish_transfer("上传好了：%s" % target, True)
+            self._refresh_models()
+
+        background(work, done=done,
+                   failed=lambda error: self._finish_transfer("上传%s：%s" % ("已取消" if state["stop"].is_set() else "失败", error), False))
+
+    # ── 本机跑的传输：进度、按钮 ──
+
+    def _start_transfer(self, kind, total):
+        state = {"kind": kind, "stop": threading.Event(), "done": 0, "total": total, "file": "", "lines": [], "lock": threading.Lock(),
+                 "window": [(time.time(), 0)]}
+        self.transfer = state
+        self.downloadBar.setValue(0)
+        self.downloadText.setText("准备上传…" if kind == "upload" else "开始下载…")
+        self._transfer_buttons()
+        self.transferTimer.start()
+        return state
+
+    def _finish_transfer(self, text, ok):
+        self._show_transfer()
+        self.transfer = None
+        self.transferTimer.stop()
+        self._transfer_buttons()
+        self.downloadText.setText(text)
+        self.log(text)
+        if ok:
+            self.downloadBar.setValue(1000)
+
+    def _transfer_buttons(self):
+        busy = self.transfer is not None
+        downloading = bool(self.conn) and (self.jobs.get("download") or {}).get("status") == "running"
+        self.uploadButton.setEnabled(bool(self.conn) and not busy)
+        self.downloadButton.setEnabled(not busy and not downloading)
+        self.downloadStop.setEnabled(busy or downloading)
+        self.downloadStop.setText("取消上传" if busy and self.transfer["kind"] == "upload" else "取消下载")
+
+    def _show_transfer(self):
+        state = self.transfer
+        if not state:
+            return
+        now = time.time()
+        with state["lock"]:
+            done, total, name = state["done"], state["total"], state["file"]
+            lines, state["lines"] = state["lines"], []
+        for line in lines:
+            self.log(line)
+        window = state["window"]
+        window.append((now, done))
+        state["window"] = window = [w for w in window if now - w[0] <= 10]
+        speed = (window[-1][1] - window[0][1]) / max(window[-1][0] - window[0][0], 0.001) if len(window) > 1 else 0
+        if not total:
+            return
+        self.downloadBar.setValue(int(done * 1000 / total))
+        left = (total - done) / speed if speed > 0 else 0
+        upload = state["kind"] == "upload"
+        self.downloadText.setText("%s %s / %s，%s/s%s%s" % ("上传" if upload else "下到这台电脑", human(done), human(total), human(speed),
+                                                          "，还要约 " + duration(left) if left else "",
+                                                          ("，正在传 " if upload else "，正在下 ") + name if name else ""))
 
     # ── 运行 ──
 
@@ -961,7 +1237,7 @@ class MainWindow(QMainWindow):
         self.editButton.setToolTip("把这个服务的设置填进「新建服务」，改了再启动（模型名和端口不变就还是这个服务）")
         self.editButton.clicked.connect(self._edit_service)
         newButton = QPushButton("新建服务…")
-        newButton.clicked.connect(lambda: self.tabs.setCurrentIndex(3))
+        newButton.clicked.connect(lambda: self.tabs.setCurrentWidget(self.servePage))
         self.serveStatus = QLabel()
         self.serveStatus.setWordWrap(True)
         buttons.addWidget(self.restartButton)
@@ -1160,7 +1436,7 @@ class MainWindow(QMainWindow):
         self.selectedService = sid
         self.watch = "serve:" + sid
         self.offsets[self.watch] = 0
-        self.tabs.setCurrentIndex(4)
+        self.tabs.setCurrentWidget(self.servicesPage)
         self._poll()
 
     def _restart_service(self):
@@ -1214,7 +1490,7 @@ class MainWindow(QMainWindow):
             spin.setValue(int(options.get(name) or 1))
             spin.blockSignals(False)
         self._parallel_summary()
-        self.tabs.setCurrentIndex(3)
+        self.tabs.setCurrentWidget(self.servePage)
 
     def _service(self):
         return self.services.get(self.selectedService) or {}
@@ -1450,8 +1726,25 @@ class MainWindow(QMainWindow):
         self.installStatus.setText("%s%s" % (texts.get(install.get("status"), ""), "：" + install["message"] if install.get("message") else ""))
         self.installButton.setEnabled(install.get("status") != "running")
         self.installStop.setEnabled(install.get("status") == "running")
-        self.downloadButton.setEnabled(download.get("status") != "running")
-        self.downloadStop.setEnabled(download.get("status") == "running")
+        self._transfer_buttons()
+        # 经本机中转的下载：重连后中转没了，在服务器上原来那个端口重新开；下完了就关
+        argv = download.get("argv") or []
+        relay = argv[argv.index("--proxy") + 1] if "--proxy" in argv[:-1] else ""
+        if download.get("status") == "running" and relay and self.conn and not self.conn.relay_ports and not self.relayReopening:
+            self.relayReopening = True
+            ports = [int(proxy.rsplit(":", 1)[-1]) for proxy in relay.split(",")]
+
+            def reopened(_):
+                self.relayReopening = False
+                self.log("接上经本机中转的下载（服务器端口 %s）" % "、".join(str(p) for p in ports))
+
+            def reopen_failed(error):
+                self.relayReopening = False
+                self.log("接不上经本机中转的下载（%s）：取消后重新点下载，会接着下" % error)
+
+            background(self.conn.open_relay, ports, done=reopened, failed=reopen_failed)
+        elif download.get("status") != "running" and (before.get("download") or {}).get("status") == "running" and self.conn and self.conn.relay_ports:
+            background(self.conn.close_relay)
         if download.get("status") in ("done", "failed", "stopped") and download.get("message") and (before.get("download") or {}).get("status") == "running":
             self.downloadText.setText(download["message"])
             if download.get("status") == "done":
@@ -1483,7 +1776,7 @@ def selftest(path):
     agent = Path(__file__).resolve().parent / "agent" / "agent.py"
     app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
-    ok = agent.is_file() and b"def cmd_probe" in agent.read_bytes() and window.tabs.count() == 5
+    ok = agent.is_file() and b"def cmd_probe" in agent.read_bytes() and window.tabs.count() == 6
     with open(path, "w", encoding="utf-8") as f:
         f.write("ok\n" if ok else "failed: agent=%s\n" % agent)
     return 0 if ok else 1
