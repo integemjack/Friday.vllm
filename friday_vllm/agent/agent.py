@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 DEFAULT_VLLM = "0.31.0"
 # 推理引擎：各装在自己的虚拟环境里（依赖的 torch 版本不一样，装一起会互相顶掉）；vLLM 照旧在 env/
 ENGINES = {
