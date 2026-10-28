@@ -4,9 +4,11 @@
     agent.py probe   --base D                          机器信息（显卡、驱动、磁盘、Python、装没装 vLLM、服务在不在跑），JSON
     agent.py install --base D [--engine vllm|sglang] [--version V] [--index URL|auto]
                                                        后台任务：建虚拟环境、装 uv、装 vLLM / SGLang
-    agent.py download --base D --repo ORG/NAME --source modelscope|huggingface|hf-mirror --dir 目标目录
-                                                       后台任务：多连接分段下载、断点续传、按 sha256 校验
-    agent.py models  --dirs 目录1,目录2                   列出已下好的模型（有 config.json 和 *.safetensors 的目录），JSON
+    agent.py download --base D --repo ORG/NAME --source modelscope|huggingface|hf-mirror --dir 目标目录 [--include 文件 ...]
+                                                       后台任务：多连接分段下载、断点续传、按 sha256 校验；任何格式都能下，
+                                                       不给 --include 按缺省挑（safetensors 不要重复的权重，GGUF 只下一种量化）
+    agent.py files   --repo ORG/NAME --source …          仓库里的文件和缺省会下哪些，JSON
+    agent.py models  --dirs 目录1,目录2                   列出已下好的模型（safetensors / PyTorch 权重、GGUF，或本工具下的），JSON
     agent.py serve   --base D [--engine vllm|sglang] --model 目录 ...   后台起一个服务（可以同时有好几个），记下 pid / 端口 / 显卡 / 密钥
     agent.py stop    --base D --job install|download|serve [--id 服务]   停掉
     agent.py forget  --base D --id 服务                   删掉停了的服务的记录和日志
@@ -710,6 +712,73 @@ def file_url(source, repo, revision, path):
     return "%s/%s/resolve/%s/%s" % (SOURCES[source], repo, revision or "main", quoted)
 
 
+# GGUF 的量化档（文件名里认）：缺省挑哪一档按这个顺序，都没有就挑最小的
+GGUF_TAG = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:IQ\d_[A-Z0-9]+|Q\d_K_[A-Z]+|Q\d_K|Q\d_\d|BF16|F16|F32|MXFP4))(?![A-Za-z0-9])",
+                      re.IGNORECASE)
+GGUF_PREFERRED = ["Q4_K_M", "UD-Q4_K_XL", "Q4_K_XL", "Q5_K_M", "Q4_K_S", "IQ4_XS", "Q6_K", "Q8_0", "Q4_0", "MXFP4", "BF16", "F16"]
+
+
+def gguf_tag(path):
+    found = GGUF_TAG.findall(path)
+    return found[-1].upper() if found else ""
+
+
+def file_format(names):
+    """一组文件是什么格式的模型：safetensors / PyTorch / GGUF / ONNX / 其他"""
+    lower = [n.lower() for n in names]
+    if any(n.endswith((".safetensors", ".safetensors.part")) for n in lower):
+        return "safetensors"
+    if any(n.endswith((".gguf", ".gguf.part")) for n in lower):
+        return "GGUF"
+    if any(re.search(r"(pytorch_model.*\.bin|\.pt|\.pth|\.ckpt)(\.part)?$", n) for n in lower):
+        return "PyTorch"
+    if any(n.endswith(".onnx") for n in lower):
+        return "ONNX"
+    return "其他"
+
+
+def default_files(files):
+    """不指定文件时下哪些：有 safetensors 照旧（不要 GGUF、原始权重、重复的 PyTorch 权重）；
+    GGUF 仓库常常十几种量化放一起，只下一种（按 GGUF_PREFERRED 挑，带上一个 mmproj）加说明、配置这些小文件；别的格式整个仓库都下"""
+    names = [f["path"] for f in files]
+    if any(n.endswith(".safetensors") for n in names):
+        return wanted(files, [], DEFAULT_EXCLUDE)
+    ggufs = [f for f in files if f["path"].lower().endswith(".gguf")]
+    if not ggufs:
+        return list(files)
+    weights = [f for f in ggufs if "mmproj" not in f["path"].lower()]
+    projectors = [f for f in ggufs if "mmproj" in f["path"].lower()]
+    groups = {}
+    for f in weights:
+        groups.setdefault(gguf_tag(f["path"]), []).append(f)
+    chosen = []
+    if groups:
+        tag = next((t for t in GGUF_PREFERRED if t in groups), None) or min(groups, key=lambda t: sum(f["size"] for f in groups[t]))
+        chosen = groups[tag]
+    if projectors:
+        chosen = chosen + [min(projectors, key=lambda f: (gguf_tag(f["path"]) not in ("F16", "BF16"), f["size"]))]
+    return [f for f in files if not f["path"].lower().endswith(".gguf")] + chosen
+
+
+def select_files(files, include):
+    """include 给了就只要这些（精确路径或通配符，不再套缺省的排除）；没给按缺省挑"""
+    if include:
+        include = set(include)
+        return [f for f in files if f["path"] in include or any(fnmatch.fnmatch(f["path"], pattern) for pattern in include)]
+    return default_files(files)
+
+
+def cmd_files(args):
+    try:
+        files = list_files(args.source, args.repo, args.revision)
+    except Exception as error:  # noqa: BLE001
+        emit({"ok": False, "error": str(error)})
+        return
+    chosen = {f["path"] for f in default_files(files)}
+    emit({"ok": True, "format": file_format([f["path"] for f in files]),
+          "files": [dict(f, default=f["path"] in chosen) for f in files]})
+
+
 def wanted(files, include, exclude):
     names = [f["path"] for f in files]
     has_safetensors = any(n.endswith(".safetensors") for n in names)
@@ -907,9 +976,12 @@ def download_repo(source, repo, directory, revision, include, stop, started=None
     服务器上的 download 任务和本机界面（没连服务器时下到这台电脑上）都用它"""
     target = os.path.abspath(os.path.expanduser(directory))
     log("列 %s 上 %s 的文件" % (source, repo))
-    files = wanted(list_files(source, repo, revision), include or [], DEFAULT_EXCLUDE)
-    if not any(f["path"].endswith(".safetensors") for f in files):
-        raise RuntimeError("这个仓库里没有 safetensors 权重，vLLM 用不了（GGUF 请用 Friday 的本地模型）")
+    files = select_files(list_files(source, repo, revision), include)
+    if not files:
+        raise RuntimeError("没有要下的文件（仓库是空的，或选的文件不在仓库里）")
+    kind = file_format([f["path"] for f in files])
+    if kind not in ("safetensors", "PyTorch"):
+        log("这是 %s 格式的模型：vLLM / SGLang 跑不了，照样下（GGUF 可以用 llama.cpp、Friday 的本地模型）" % kind)
     total = sum(f["size"] for f in files)
     free = disk_free(target)
     if free and free["free"] < total:
@@ -955,9 +1027,18 @@ def describe_model(directory):
         if quant.get("format"):
             method = quant["format"]
     meta = read_json(os.path.join(directory, ".friday-vllm.json"), {})
+    names = []
+    for root, _, files in os.walk(directory):
+        names += [os.path.relpath(os.path.join(root, n), directory) for n in files]
+    kind = file_format(names)
+    if kind == "GGUF":
+        method = "、".join(sorted({gguf_tag(n) for n in names if n.lower().endswith((".gguf", ".gguf.part")) and gguf_tag(n)})) or method
     return {
         "path": directory,
         "name": meta.get("repo") or os.path.basename(directory.rstrip("/")),
+        "format": kind,
+        # vLLM / SGLang 能直接加载的：有 config.json 的 safetensors / PyTorch 权重
+        "servable": kind in ("safetensors", "PyTorch") and bool(config),
         "size": size,
         "architectures": config.get("architectures") or [],
         "model_type": config.get("model_type") or text.get("model_type") or "",
@@ -966,6 +1047,13 @@ def describe_model(directory):
         "heads": attention_heads(directory),
         "complete": not partial,
     }
+
+
+def is_model_dir(names):
+    """看着像一个模型的目录：本工具下的（.friday-vllm.json）、config.json 加权重、或有 GGUF 文件"""
+    lower = [n.lower() for n in names]
+    weights = any(re.search(r"(\.safetensors|pytorch_model.*\.bin|\.gguf)(\.part)?$", n) for n in lower)
+    return ".friday-vllm.json" in names or weights and ("config.json" in names or any(".gguf" in n for n in lower))
 
 
 def cmd_models(args):
@@ -981,7 +1069,7 @@ def cmd_models(args):
                 dirs[:] = []
                 continue
             dirs[:] = [d for d in dirs if not d.startswith(".")]
-            if "config.json" in names and any(n.endswith((".safetensors", ".safetensors.part")) for n in names):
+            if is_model_dir(names):
                 if root not in seen:
                     seen.add(root)
                     found.append(describe_model(root))
@@ -1001,8 +1089,8 @@ def cmd_delete_model(args):
         emit({"ok": False, "error": "%s 已经不在了" % target})
         return
     names = os.listdir(target)
-    if not ("config.json" in names or ".friday-vllm.json" in names or any(n.endswith((".safetensors", ".safetensors.part")) for n in names)):
-        emit({"ok": False, "error": "%s 看着不像模型目录（没有 config.json、safetensors），不删" % target})
+    if not ("config.json" in names or is_model_dir(names)):
+        emit({"ok": False, "error": "%s 看着不像模型目录（没有 config.json、模型权重），不删" % target})
         return
     for service in services_status(args.base).values():
         model = os.path.realpath(service.get("model") or "")
@@ -1231,6 +1319,10 @@ def main():
     command.add_argument("--revision", default="")
     command.add_argument("--include", action="append")
     command.add_argument("--proxy", default="", help="经这个 HTTP 代理下载（本机中转时是 SSH 远程转发过来的端口）")
+    command = add("files", cmd_files)
+    command.add_argument("--repo", required=True)
+    command.add_argument("--source", default="modelscope", choices=sorted(SOURCES))
+    command.add_argument("--revision", default="")
     command = add("models", cmd_models)
     command.add_argument("--dirs", default="")
     command = add("delete-model", cmd_delete_model)

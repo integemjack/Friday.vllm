@@ -14,7 +14,8 @@ import urllib.request
 
 from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QFont, QGuiApplication
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QGridLayout,
                                QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
                                QWidget)
@@ -59,8 +60,8 @@ def duration(seconds):
 
 
 def local_model_files(folder):
-    """本机模型目录里要传的文件 [(本机路径, 相对路径, 大小)]：跟服务器上下载时一样不要 GGUF、原始权重、重复的 PyTorch 权重，
-    隐藏目录（.cache、.git）和没下完的不要"""
+    """本机模型目录里要传的文件 [(本机路径, 相对路径, 大小)]：有 safetensors 时跟服务器上下载时一样不要 GGUF、原始权重、
+    重复的 PyTorch 权重；别的格式（GGUF、MLX、ONNX……）整个文件夹都传。隐藏目录（.cache、.git）和没下完的不要"""
     files = []
     for root, dirs, names in os.walk(folder, followlinks=True):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -69,15 +70,72 @@ def local_model_files(folder):
             rel = os.path.relpath(path, folder).replace(os.sep, "/")
             if name.startswith(".") or name.endswith((".part", ".partdone", ".incomplete", ".lock")):
                 continue
-            if any(fnmatch.fnmatch(rel, pattern) for pattern in DEFAULT_EXCLUDE):
-                continue
             try:
                 files.append((path, rel, os.path.getsize(path)))
             except OSError:
                 continue
     if any(rel.endswith(".safetensors") for _, rel, _ in files):
-        files = [f for f in files if not (f[1].startswith("pytorch_model") and f[1].endswith(".bin")) and not f[1].endswith(".bin.index.json")]
+        files = [f for f in files if not any(fnmatch.fnmatch(f[1], pattern) for pattern in DEFAULT_EXCLUDE)
+                 and not (f[1].startswith("pytorch_model") and f[1].endswith(".bin")) and not f[1].endswith(".bin.index.json")]
     return files
+
+
+class FilesDialog(QDialog):
+    """选要下仓库里的哪些文件：缺省勾的是 agent.py 缺省会下的（GGUF 只勾一种量化）"""
+
+    def __init__(self, parent, repo, kind, files, chosen):
+        super().__init__(parent)
+        self.setWindowTitle("选文件：%s" % repo)
+        self.resize(760, 560)
+        self.files = files
+        layout = QVBoxLayout(self)
+        note = QLabel("%s 格式，%d 个文件。勾上要下的%s" % (kind, len(files), "（GGUF 一般只要一种量化，比如 Q4_K_M；带视觉的再加一个 mmproj）"
+                                                       if kind == "GGUF" else ""))
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.table = QTableWidget(len(files), 2)
+        self.table.setHorizontalHeaderLabels(["文件", "大小"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        for row, f in enumerate(files):
+            item = QTableWidgetItem(f["path"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if f["path"] in chosen else Qt.Unchecked)
+            self.table.setItem(row, 0, item)
+            size = QTableWidgetItem(human(f["size"]))
+            size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(row, 1, size)
+        self.table.itemChanged.connect(self._summary)
+        layout.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        for title, pick in (("按缺省", lambda f: f.get("default")), ("全选", lambda f: True), ("全不选", lambda f: False)):
+            button = QPushButton(title)
+            button.clicked.connect(lambda _=False, pick=pick: self._check(pick))
+            row.addWidget(button)
+        self.total = QLabel()
+        row.addWidget(self.total, 1)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._summary()
+
+    def _check(self, pick):
+        self.table.blockSignals(True)
+        for row, f in enumerate(self.files):
+            self.table.item(row, 0).setCheckState(Qt.Checked if pick(f) else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._summary()
+
+    def chosen(self):
+        return {f["path"] for row, f in enumerate(self.files) if self.table.item(row, 0).checkState() == Qt.Checked}
+
+    def _summary(self, *_):
+        chosen = self.chosen()
+        self.total.setText("勾了 %d 个，共 %s" % (len(chosen), human(sum(f["size"] for f in self.files if f["path"] in chosen))))
 
 
 def guess_repo(folder):
@@ -527,8 +585,8 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self._refresh_models)
         dirRow.addWidget(refresh)
         localLayout.addLayout(dirRow)
-        self.modelTable = QTableWidget(0, 6)
-        self.modelTable.setHorizontalHeaderLabels(["模型", "大小", "架构", "量化", "状态", "目录"])
+        self.modelTable = QTableWidget(0, 7)
+        self.modelTable.setHorizontalHeaderLabels(["模型", "格式", "大小", "架构", "量化", "状态", "目录"])
         self._table_style(self.modelTable)
         self.modelTable.cellDoubleClicked.connect(self._use_model_row)
         self.modelTable.itemSelectionChanged.connect(self._model_selection_changed)
@@ -578,10 +636,10 @@ class MainWindow(QMainWindow):
         self.sortBy.currentIndexChanged.connect(self._sort_changed)
         filterRow.addWidget(self.sortBy)
         filterRow.addSpacing(12)
-        filterRow.addWidget(QLabel("量化"))
+        filterRow.addWidget(QLabel("量化 / 格式"))
         self.quantFilter = QComboBox()
         self.quantFilter.addItem("全部", "")
-        for name in catalog.QUANT_NAMES:
+        for name in catalog.QUANT_NAMES + catalog.FORMAT_NAMES:
             self.quantFilter.addItem(name, name)
         self.quantFilter.currentIndexChanged.connect(self._apply_filters)
         filterRow.addWidget(self.quantFilter)
@@ -594,6 +652,11 @@ class MainWindow(QMainWindow):
         self.engineSupported.setToolTip("按装好的 vLLM / SGLang 支持的模型架构；架构不知道的（Hugging Face 的搜索结果）照样列")
         self.engineSupported.toggled.connect(self._apply_filters)
         filterRow.addWidget(self.engineSupported)
+        self.vllmOnly = QCheckBox("只看 vLLM / SGLang 能跑的")
+        self.vllmOnly.setToolTip("去掉 GGUF、MLX、ONNX 这类格式和昇腾、国产卡、手机芯片的转换版（按仓库名认）；不勾什么模型都列、都能下")
+        self.vllmOnly.setChecked(self.settings.value("vllmOnly", "false") == "true")
+        self.vllmOnly.toggled.connect(lambda on: (self.settings.setValue("vllmOnly", "true" if on else "false"), self._apply_filters()))
+        filterRow.addWidget(self.vllmOnly)
         filterRow.addStretch(1)
         self.resultCount = QLabel()
         self.resultCount.setStyleSheet("color: gray")
@@ -601,8 +664,8 @@ class MainWindow(QMainWindow):
         remoteLayout.addLayout(filterRow)
         self.resultsAll = []
         self.results = []
-        self.resultTable = QTableWidget(0, 7)
-        self.resultTable.setHorizontalHeaderLabels(["仓库", "量化", "大小", "下载量", "更新", "架构", "装好的引擎支持吗"])
+        self.resultTable = QTableWidget(0, 8)
+        self.resultTable.setHorizontalHeaderLabels(["仓库", "格式", "量化", "大小", "下载量", "更新", "架构", "装好的引擎支持吗"])
         self._table_style(self.resultTable)
         self.resultTable.itemSelectionChanged.connect(self._pick_result)
         remoteLayout.addWidget(self.resultTable)
@@ -623,7 +686,19 @@ class MainWindow(QMainWindow):
         self.variantTimer.setInterval(600)
         self.variantTimer.timeout.connect(self._find_variants)
         self.source.currentIndexChanged.connect(self._repo_changed)
-        grid.addWidget(QLabel("下到"), 2, 0)
+        grid.addWidget(QLabel("文件"), 2, 0)
+        self.filesText = QLabel()
+        self.filesText.setStyleSheet("color: gray")
+        self.filesButton = QPushButton("选文件…")
+        self.filesButton.setToolTip("选只下仓库里的哪些文件（GGUF 仓库常有十几种量化，缺省只下一种）")
+        self.filesButton.clicked.connect(self._pick_files)
+        filesRow = QHBoxLayout()
+        filesRow.addWidget(self.filesText, 1)
+        filesRow.addWidget(self.filesButton)
+        grid.addLayout(filesRow, 2, 1)
+        self.repoFiles = None        # 仓库里的文件：{"key": (来源, 仓库), "format", "files": [{path, size, default}]}
+        self.fileChoice = None       # 自己选的文件（路径集合）；None = 按缺省
+        grid.addWidget(QLabel("下到"), 3, 0)
         self.target = QLineEdit()
         self.target.setPlaceholderText("服务器上的目录")
         self.browseTarget = QPushButton("选目录…")
@@ -632,15 +707,15 @@ class MainWindow(QMainWindow):
         targetRow = QHBoxLayout()
         targetRow.addWidget(self.target, 1)
         targetRow.addWidget(self.browseTarget)
-        grid.addLayout(targetRow, 2, 1)
+        grid.addLayout(targetRow, 3, 1)
         self.downloadButton = QPushButton("下载")
         self.downloadButton.clicked.connect(self._download)
         self.downloadStop = QPushButton("取消下载")
         self.downloadStop.clicked.connect(self._cancel_download)
         grid.addWidget(self.downloadButton, 0, 2)
-        grid.addWidget(self.downloadStop, 2, 2)
+        grid.addWidget(self.downloadStop, 3, 2)
         self.viaLabel = QLabel("下载方式")
-        grid.addWidget(self.viaLabel, 3, 0)
+        grid.addWidget(self.viaLabel, 4, 0)
         self.downloadVia = QComboBox()
         self.downloadVia.addItem("服务器直接下", "direct")
         self.downloadVia.addItem("经本机中转（服务器走这台电脑的网络下，本机有代理也走代理；窗口要开着）", "relay")
@@ -648,11 +723,11 @@ class MainWindow(QMainWindow):
                                     "下载请求经它从这台电脑出去。服务器那边照样多连接、断点续传；速度看这台电脑的网和上行带宽")
         index = self.downloadVia.findData(self.settings.value("downloadVia", "direct"))
         self.downloadVia.setCurrentIndex(max(0, index))
-        grid.addWidget(self.downloadVia, 3, 1)
+        grid.addWidget(self.downloadVia, 4, 1)
         self.uploadButton = QPushButton("从本机上传…")
-        self.uploadButton.setToolTip("选这台电脑上已经下好的模型文件夹（有 config.json 和 safetensors），传到服务器上；断了重新传会接着传")
+        self.uploadButton.setToolTip("选这台电脑上已经下好的模型文件夹，传到服务器上；断了重新传会接着传")
         self.uploadButton.clicked.connect(self._upload_model)
-        grid.addWidget(self.uploadButton, 3, 2)
+        grid.addWidget(self.uploadButton, 4, 2)
         # 在本机跑的传输（上传到服务器、没连服务器时下到这台电脑上）：{"kind", "stop", "done", "total", "file", "lines", 速度窗口}
         self.transfer = None
         self.relayReopening = False
@@ -693,7 +768,8 @@ class MainWindow(QMainWindow):
         self.models = result.get("models") or []
         self.modelTable.setRowCount(len(self.models))
         for row, model in enumerate(self.models):
-            values = [model["name"], human(model["size"]), "、".join(model["architectures"]), model["quantization"] or "—",
+            values = [model["name"], model.get("format") or "safetensors", human(model["size"]), "、".join(model["architectures"]),
+                      model["quantization"] or "—",
                       "完整" if model["complete"] else "没下完", model["path"]]
             for column, value in enumerate(values):
                 self.modelTable.setItem(row, column, QTableWidgetItem(str(value)))
@@ -701,7 +777,8 @@ class MainWindow(QMainWindow):
         self.serveModel.blockSignals(True)
         self.serveModel.clear()
         for model in self.models:
-            if model["complete"]:
+            # 旧 agent 没有 servable：都算能跑
+            if model["complete"] and model.get("servable", True):
                 self.serveModel.addItem("%s（%s）" % (model["name"], human(model["size"])), model["path"])
         self.serveModel.blockSignals(False)
         index = self.serveModel.findText(current)
@@ -716,7 +793,7 @@ class MainWindow(QMainWindow):
 
     def _model_selection_changed(self):
         model = self._selected_local_model()
-        self.useModelButton.setEnabled(bool(model and model["complete"]))
+        self.useModelButton.setEnabled(bool(model and model["complete"] and model.get("servable", True)))
         self.deleteModelButton.setEnabled(bool(model))
 
     def _delete_model(self):
@@ -774,7 +851,7 @@ class MainWindow(QMainWindow):
         self.resultsAll = models
         self._apply_filters()
         if not models:
-            self.log("没搜到（GGUF、MLX 这类 vLLM / SGLang 用不了的已经去掉了）")
+            self.log("没搜到")
 
     def _engine_archs(self):
         """装好的引擎各自支持的架构（没装、没读到的不算）"""
@@ -785,7 +862,9 @@ class MainWindow(QMainWindow):
         models = list(self.resultsAll)
         quant = self.quantFilter.currentData()
         if quant:
-            models = [m for m in models if m.quant == quant]
+            models = [m for m in models if m.quant == quant or m.format == quant]
+        if self.vllmOnly.isChecked():
+            models = [m for m in models if not m.format]
         cards = self.probe.get("gpus") or []
         self.fitsGpu.setEnabled(bool(cards))
         if not cards:
@@ -808,18 +887,20 @@ class MainWindow(QMainWindow):
             if archs and model.architectures:
                 supported = "、".join("%s %s" % (ENGINES[e][0], "支持" if any(x in known for x in model.architectures) else "不支持")
                                      for e, known in archs.items())
-            values = [model.repo, model.quant, human(model.size), str(model.downloads or ""),
+            values = [model.repo, model.format or "—", model.quant, human(model.size), str(model.downloads or ""),
                       time.strftime("%Y-%m-%d", time.localtime(model.updated)) if model.updated else "—",
                       "、".join(model.architectures), supported]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column in (2, 3):
+                if column in (3, 4):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.resultTable.setItem(row, column, item)
         self.resultCount.setText("显示 %d / 共 %d 个" % (len(models), len(self.resultsAll)) if self.resultsAll else "")
 
     def _gpu_problem(self, model):
         """这台的显卡跑不动这个模型的原因（量化方式不支持、放不下）；跑得动或不知道显卡时为空"""
+        if model.format:
+            return "vLLM / SGLang 跑不了（%s）" % model.format
         cards = self.probe.get("gpus") or []
         if not cards:
             return ""
@@ -835,10 +916,82 @@ class MainWindow(QMainWindow):
         return ""
 
     def _repo_changed(self, *_):
+        self.fileChoice = None
         self.variantTimer.start()
+
+    def _find_files(self):
+        """仓库填好后列它的文件：缺省会下哪些、多大，「选文件…」里改"""
+        repo = self.repo.text().strip()
+        key = (self.source.currentData(), repo)
+        if "/" not in repo:
+            self.repoFiles = None
+            self.filesText.setText("")
+            self.filesButton.setEnabled(False)
+            return
+        if self.repoFiles and self.repoFiles["key"] == key:
+            self._show_files()
+            return
+        self.repoFiles = {"key": key, "format": "", "files": None}
+        self.filesText.setText("在列 %s 的文件…" % repo)
+        self.filesButton.setEnabled(False)
+
+        def work():
+            agentlib.setup_http()
+            files = agentlib.list_files(key[0], repo, "")
+            chosen = {f["path"] for f in agentlib.default_files(files)}
+            return agentlib.file_format([f["path"] for f in files]), [dict(f, default=f["path"] in chosen) for f in files]
+
+        def done(result):
+            if self.repoFiles and self.repoFiles["key"] == key:
+                self.repoFiles["format"], self.repoFiles["files"] = result
+                self._show_files()
+
+        def failed(error):
+            if self.repoFiles and self.repoFiles["key"] == key:
+                self.repoFiles = None
+                self.filesText.setText("列不出文件（%s），下载时按缺省挑" % (str(error) or error.__class__.__name__)[:120])
+
+        background(work, done=done, failed=failed)
+
+    def _show_files(self):
+        info = self.repoFiles or {}
+        files = info.get("files")
+        if files is None:
+            return
+        self.filesButton.setEnabled(bool(files))
+        if self.fileChoice is None:
+            chosen = [f for f in files if f["default"]]
+            how = {"safetensors": "缺省：safetensors 权重和配置", "GGUF": "缺省：只下一种量化（%s）" % "、".join(
+                sorted({agentlib.gguf_tag(f["path"]) for f in chosen if f["path"].lower().endswith(".gguf") and agentlib.gguf_tag(f["path"])}))
+            }.get(info["format"], "缺省：整个仓库")
+        else:
+            chosen = [f for f in files if f["path"] in self.fileChoice]
+            how = "自己选的"
+        note = "" if info["format"] in ("safetensors", "PyTorch") else "；%s 格式，vLLM / SGLang 跑不了" % info["format"]
+        self.filesText.setText("%s，%d / %d 个文件，%s%s" % (how, len(chosen), len(files), human(sum(f["size"] for f in chosen)), note))
+
+    def _pick_files(self):
+        info = self.repoFiles or {}
+        if not info.get("files"):
+            return
+        chosen = self.fileChoice if self.fileChoice is not None else {f["path"] for f in info["files"] if f["default"]}
+        dialog = FilesDialog(self, info["key"][1], info["format"], info["files"], chosen)
+        if dialog.exec() == QDialog.Accepted:
+            picked = dialog.chosen()
+            self.fileChoice = None if picked == {f["path"] for f in info["files"] if f["default"]} else picked
+            self._show_files()
+
+    def _include_args(self):
+        """自己选了文件时传给 agent 的 --include（精确路径）；按缺省为空"""
+        if self.fileChoice is None:
+            return []
+        if not self.fileChoice:
+            raise ValueError("一个文件都没选")
+        return sorted(self.fileChoice)
 
     def _find_variants(self):
         """仓库填好后找同一个模型的原版和各种量化版，列进「量化版本」"""
+        self._find_files()
         repo = self.repo.text().strip()
         source = self.source.currentData()
         if "/" not in repo:
@@ -870,7 +1023,7 @@ class MainWindow(QMainWindow):
         self.variant.clear()
         for model in models:
             problem = self._gpu_problem(model)
-            self.variant.addItem("%s · %s%s%s" % (model.quant, model.repo, "（%s）" % human(model.size) if model.size else "",
+            self.variant.addItem("%s · %s%s%s" % (model.format or model.quant, model.repo, "（%s）" % human(model.size) if model.size else "",
                                                  " · " + problem if problem else ""), model.repo)
         self.variant.setEnabled(len(models) > 1)
         self.variant.setToolTip("没找到别的版本" if len(models) <= 1 else
@@ -913,7 +1066,7 @@ class MainWindow(QMainWindow):
         self.browseTarget.setVisible(not connected)
         self.viaLabel.setVisible(connected)
         self.downloadVia.setVisible(connected)
-        self.uploadButton.setToolTip("选这台电脑上已经下好的模型文件夹（有 config.json 和 safetensors），传到服务器上；断了重新传会接着传"
+        self.uploadButton.setToolTip("选这台电脑上已经下好的模型文件夹，传到服务器上；断了重新传会接着传"
                                      if connected else "连上服务器后才能传")
         self.target.clear()
         self._suggest_target(self.repo.text())
@@ -933,8 +1086,13 @@ class MainWindow(QMainWindow):
         if "/" not in repo or not target:
             QMessageBox.information(self, APP, "填仓库（组织/名字）和%s的目录" % ("服务器上" if self.conn else "这台电脑上"))
             return
+        try:
+            include = self._include_args()
+        except ValueError as error:
+            QMessageBox.information(self, APP, "%s：在「选文件…」里至少勾一个" % error)
+            return
         if not self.conn:
-            self._download_local(repo, target)
+            self._download_local(repo, target, include)
             return
         via = self.downloadVia.currentData()
         self.settings.setValue("downloadVia", via)
@@ -944,11 +1102,14 @@ class MainWindow(QMainWindow):
         self.downloadBar.setValue(0)
         self.downloadText.setText("开始下载…")
         self.downloadButton.setEnabled(False)
-        self.log("下载 %s → %s（%s%s）" % (repo, target, self.source.currentText(), "，经本机中转" if via == "relay" else ""))
+        self.log("下载 %s → %s（%s%s%s）" % (repo, target, self.source.currentText(), "，经本机中转" if via == "relay" else "",
+                                           "，选了 %d 个文件" % len(include) if include else ""))
         conn = self.conn
 
         def work():
             args = ["download", "--repo", repo, "--source", self.source.currentData(), "--dir", target]
+            for path in include:
+                args += ["--include", path]
             if via == "relay":
                 args += ["--proxy", ",".join("http://127.0.0.1:%d" % port for port in conn.open_relay())]
             else:
@@ -970,7 +1131,7 @@ class MainWindow(QMainWindow):
 
     # ── 没连服务器：下到这台电脑上 ──
 
-    def _download_local(self, repo, target):
+    def _download_local(self, repo, target, include=()):
         if self.transfer:
             return
         if not os.path.isabs(target):
@@ -992,7 +1153,7 @@ class MainWindow(QMainWindow):
             agentlib.sink = sink
             agentlib.setup_http()
             try:
-                return agentlib.download_repo(source, repo, target, "", [], state["stop"])
+                return agentlib.download_repo(source, repo, target, "", list(include), state["stop"])
             finally:
                 agentlib.sink = None
 
@@ -1008,17 +1169,23 @@ class MainWindow(QMainWindow):
     def _upload_model(self):
         if not self.conn or self.transfer:
             return
-        folder = QFileDialog.getExistingDirectory(self, "选本机上的模型文件夹（有 config.json 和 safetensors 的那层）",
+        folder = QFileDialog.getExistingDirectory(self, "选本机上的模型文件夹",
                                                   self.settings.value("uploadFrom", ""))
         if not folder:
             return
         self.settings.setValue("uploadFrom", os.path.dirname(folder))
         files = local_model_files(folder)
-        names = {rel for _, rel, _ in files}
-        if "config.json" not in names or not any(n.endswith(".safetensors") for n in names):
-            QMessageBox.information(self, APP, "%s 里没有 config.json 和 safetensors 权重，vLLM / SGLang 用不了。\n\n"
-                                               "要选模型本身那层文件夹（Hugging Face 缓存是 models--组织--名字/snapshots/<一串字符>）。" % folder)
+        if not files:
+            QMessageBox.information(self, APP, "%s 里没有要传的文件" % folder)
             return
+        kind = agentlib.file_format([rel for _, rel, _ in files])
+        if kind not in ("safetensors", "PyTorch") or "config.json" not in {rel for _, rel, _ in files}:
+            answer = QMessageBox.question(self, "从本机上传", "%s 里不是 vLLM / SGLang 能直接跑的模型（%s%s），照样传吗？\n\n"
+                                          "要传 vLLM 用的模型，选模型本身那层文件夹（Hugging Face 缓存是 models--组织--名字/snapshots/<一串字符>）。" % (
+                                              folder, kind, "，没有 config.json" if kind in ("safetensors", "PyTorch") else ""),
+                                          QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer != QMessageBox.Yes:
+                return
         total = sum(size for _, _, size in files)
         repo = guess_repo(folder)
         default = "%s/models/%s" % (self.conn.base.rstrip("/"), repo)

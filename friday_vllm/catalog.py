@@ -1,7 +1,7 @@
 """在本机查可下载的模型：魔搭（ModelScope）、Hugging Face（或 hf-mirror）。
 
-只列 vLLM / SGLang 能用的：有 safetensors 权重的仓库（名字带 GGUF / MLX / ONNX 的排除）。下载在服务器上做（agent.py download），
-这里只负责搜索、排序和看看仓库里有什么；筛选（量化、显存放不放得下、引擎支不支持）在界面上对搜到的结果做。
+什么格式的模型都列（GGUF、MLX、ONNX……按名字标出格式，界面上可以只看 vLLM / SGLang 能跑的）。下载在服务器上做（agent.py download），
+这里只负责搜索、排序和看看仓库里有什么；筛选（格式、量化、显存放不放得下、引擎支不支持）在界面上对搜到的结果做。
 """
 import json
 import re
@@ -21,9 +21,28 @@ SORTS = {
     "stars": ("收藏数", "StarsCount", "likes"),
 }
 PAGE_SIZE = 100
-# 不是给 N 卡上的 vLLM / SGLang 用的：GGUF、MLX 这类格式，昇腾 NPU、海光 / 沐曦 / 天数这类国产卡、手机芯片的转换版
-NOT_FOR_VLLM = re.compile(r"(gguf|mlx|onnx|openvino|coreml|exl2|ggml|npu|ascend|310p|910b|mindie|rknn|qnn|hygon|metax|iluvatar|corex|"
-                          r"cambricon|enflame|kunlunxin)", re.IGNORECASE)
+# 不是给 N 卡上的 vLLM / SGLang 用的格式（按仓库名认）：GGUF、MLX 这类，昇腾 NPU、海光 / 沐曦 / 天数这类国产卡、手机芯片的转换版；
+# 照样能下，界面上标出来
+FORMATS = [
+    ("GGUF", re.compile(r"gguf|ggml", re.IGNORECASE)),
+    ("MLX", re.compile(r"mlx", re.IGNORECASE)),
+    ("ONNX", re.compile(r"onnx", re.IGNORECASE)),
+    ("OpenVINO", re.compile(r"openvino", re.IGNORECASE)),
+    ("CoreML", re.compile(r"coreml", re.IGNORECASE)),
+    ("EXL2", re.compile(r"exl2|exl3", re.IGNORECASE)),
+    ("昇腾", re.compile(r"npu|ascend|310p|910b|mindie", re.IGNORECASE)),
+    ("国产卡", re.compile(r"hygon|metax|iluvatar|corex|cambricon|enflame|kunlunxin", re.IGNORECASE)),
+    ("端侧", re.compile(r"rknn|qnn", re.IGNORECASE)),
+]
+FORMAT_NAMES = [name for name, _ in FORMATS]
+
+
+def format_of(repo):
+    """按仓库名认出的格式；看不出（一般是 safetensors，vLLM / SGLang 能用）为空"""
+    for name, pattern in FORMATS:
+        if pattern.search(repo):
+            return name
+    return ""
 # 量化方式：按仓库名认（顺序要紧：NVFP4 先于 FP8 之类）
 QUANTS = [
     ("NVFP4", re.compile(r"nvfp4|(?<![a-z])fp4|mxfp4", re.IGNORECASE)),
@@ -51,7 +70,9 @@ SUGGESTED = [
 
 # 量化版的名字在原版后面加的、本身不是量化方式的词（FP8-dynamic、AWQ-4bit、int4-AutoRound、SF-FP8-WC……）
 QUANT_EXTRA_WORDS = {"dynamic", "static", "fast", "autoround", "mixed", "sf", "wc", "channel", "block", "quantized", "quant", "nf4",
-                     "g128", "g64", "g32", "sym", "asym", "marlin", "gemm", "gemv", "compressed", "tensors"}
+                     "g128", "g64", "g32", "sym", "asym", "marlin", "gemm", "gemv", "compressed", "tensors",
+                     # 别的格式的转换版（Qwen3-8B-GGUF、Qwen3-8B-MLX-4bit）也算同一个模型的版本
+                     "gguf", "mlx", "onnx", "openvino", "exl2", "exl3"}
 # 同一个量化方式有好几家时排前面的：官方、常做量化版的
 TRUSTED = ["Qwen", "deepseek-ai", "nvidia", "RedHatAI", "QuantTrio", "unsloth", "Intel", "meta-llama", "mistralai", "zai-org", "moonshotai",
            "openai", "google"]
@@ -72,7 +93,9 @@ class Model:
         self.architectures = architectures or []
         self.updated = updated      # 秒（Unix 时间）；不知道为 0
         self.stars = stars
-        self.quant = quant_of(repo)
+        self.format = format_of(repo)
+        # GGUF 仓库里一般有好几种量化，下的时候选
+        self.quant = "多种" if self.format == "GGUF" else quant_of(repo)
 
 
 def base_name(repo):
@@ -109,7 +132,9 @@ def variants(source, repo):
     def rank(model):
         org = model.repo.split("/")[0]
         trust = 0 if org == owner else 1 + TRUSTED.index(org) if org in TRUSTED else 99
-        return order.get(model.quant, 99), trust, -(model.downloads or 0)
+        # 别的格式（GGUF、MLX……）排在 vLLM / SGLang 能用的后面
+        kind = 100 + FORMAT_NAMES.index(model.format) if model.format else 0
+        return kind, order.get(model.quant, 99), trust, -(model.downloads or 0)
     return sorted(models, key=rank)
 
 
@@ -142,17 +167,15 @@ def search(source, text, sort="default", limit=PAGE_SIZE):
         models = []
         for item in (data.get("Data") or {}).get("Model", {}).get("Models") or []:
             repo = "%s/%s" % (item.get("Path"), item.get("Name"))
-            if NOT_FOR_VLLM.search(repo):
-                continue
             models.append(Model(repo, int(item.get("StorageSize") or 0), int(item.get("Downloads") or 0), item.get("Architectures") or [],
                                 int(item.get("LastUpdatedTime") or 0), int(item.get("Stars") or 0)))
         return models
-    params = {"search": text, "limit": limit, "filter": "safetensors", "full": "false"}
+    params = {"search": text, "limit": limit, "full": "false"}
     if SORTS[sort][2]:
         params.update({"sort": SORTS[sort][2], "direction": -1})
     data = _get(base + "/api/models?" + urllib.parse.urlencode(params))
     return [Model(item["id"], 0, int(item.get("downloads") or 0), [], _hf_time(item.get("lastModified")), int(item.get("likes") or 0))
-            for item in data if not NOT_FOR_VLLM.search(item["id"])]
+            for item in data]
 
 
 def info(source, repo):
@@ -167,7 +190,10 @@ def info(source, repo):
             return Model(repo, int(item.get("StorageSize") or 0), int(item.get("Downloads") or 0), item.get("Architectures") or [],
                          int(item.get("LastUpdatedTime") or 0), int(item.get("Stars") or 0))
         data = _get("%s/api/models/%s?blobs=true" % (base, repo))
-        size = sum(int(s.get("size") or 0) for s in data.get("siblings") or [] if str(s.get("rfilename", "")).endswith(".safetensors"))
+        siblings = data.get("siblings") or []
+        weights = [s for s in siblings if str(s.get("rfilename", "")).endswith(".safetensors")]
+        # 有 safetensors 算权重的大小；别的格式算整个仓库（GGUF 是所有量化档加起来）
+        size = sum(int(s.get("size") or 0) for s in (weights or siblings))
         config = data.get("config") or {}
         return Model(repo, size, int(data.get("downloads") or 0), config.get("architectures") or [], _hf_time(data.get("lastModified")),
                      int(data.get("likes") or 0))
