@@ -516,7 +516,8 @@ def cmd_stop(args):
         os.killpg(int(pid), signal.SIGTERM)
     except OSError:
         os.kill(int(pid), signal.SIGTERM)
-    for _ in range(30):
+    # 下载停了不丢已下好的段（.partdone 记着，下次接着下）：等 3 秒就强杀，不卡在网络读上；服务、安装等 15 秒让它好好退出
+    for _ in range(6 if job == "download" else 30):
         if not alive(pid):
             break
         time.sleep(0.5)
@@ -829,12 +830,15 @@ def fetch_range(source, start, end, out_path, progress, name, stop):
         try:
             url = source["url"]
             request = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (position, end), "User-Agent": "friday-vllm/" + VERSION})
-            with urlopen(request, timeout=60) as response, open(out_path, "r+b") as f:
+            with urlopen(request, timeout=30) as response, open(out_path, "r+b") as f:
                 if response.status != 206 and (position != 0 or response.headers.get("Content-Length") not in (None, str(end - position + 1))):
                     raise RuntimeError("服务器不支持分段下载（HTTP %d）" % response.status)
                 f.seek(position)
                 while position <= end:
-                    block = response.read(min(1 << 20, end - position + 1))
+                    # 取消了马上停（不等这一段 64 MB 下完）：每读一小块看一眼；没下完的这段下次从头下
+                    if stop.is_set():
+                        return False
+                    block = response.read(min(256 << 10, end - position + 1))
                     if not block:
                         break
                     f.write(block)
@@ -854,7 +858,9 @@ def fetch_range(source, start, end, out_path, progress, name, stop):
                 # 偶尔断一下（DNS、CDN 卡一下）自动重试就好，连着 3 次以上才记
                 if failures >= 3:
                     log("%s 的 %d–%d 段连续第 %d 次失败（自动重试）：%s" % (name, start, end, failures, str(error)[:120]))
-                time.sleep(min(30, 2 ** failures))
+                # 等着重试时取消了也马上停
+                if stop.wait(min(30, 2 ** failures)):
+                    return False
     return True
 
 
